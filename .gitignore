@@ -1,0 +1,43 @@
+# data — never commit raw BIPs or gold set
+data/raw/
+data/gold/
+data/anchors/
+data/synthetic/
+
+# model checkpoints
+models/
+
+# logs
+logs/
+
+# results
+results/
+
+# environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# API keys / secrets
+secrets.py
+*.key
+.env*
+!.env.example
