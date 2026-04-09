@@ -1,4 +1,4 @@
-# BIP Synthetic Data Generation for Principal Assessment Auditing
+# BIP Synthetic Data Generation for Principal Assessment
 
 Rubric-aligned synthetic BIP generation with dual-model verification,
 trained assessor evaluation, and scoring deviation audit on the

@@ -1,0 +1,315 @@
+# EDA Decision Log
+# Project: Synthetic_NEE_Data
+# Date: April 2026
+# Based on: 01_corpus_exploration.ipynb results + rubric.tsv + BIP Process Organizer PDF
+# Author: sakter6
+
+================================================================================
+SECTION 1: WHAT WE LEARNED FROM THE DATA
+================================================================================
+
+CORPUS SIZE AND USABILITY
+- Total BIPs in corpus: 19,719
+- Scored BIPs: 13,871 (70.3%)
+- Missing scores: 5,848 (29.7%)
+- no_score flag set: 5,397 (slightly different from null count -- two separate flags)
+- Usable BIPs for style learner (text >= 50 tokens, not empty): 13,645
+- Usable scored BIPs (text >= 50 tokens + has score): 10,237
+- Empty text BIPs: 1,319 (6.7%)
+- Duplicate texts: 4,925 (25.0%) -- same text submitted for multiple elements or years
+
+IDENTIFIERS
+- Unique principals (PersonId): 1,086
+- Unique buildings (BuildingID): 612
+- Unique districts (DistrictID): 156
+- School years covered: 2015-2016 through 2023-2024 (9 years)
+- Every principal has at least 7 BIPs, mean is 18.2 BIPs per principal
+- No principal has only 1 BIP -- all principals appear multiple times
+- This means train/test splits MUST be done by PersonId (group-based split)
+  to avoid data leakage
+
+SCORE DISTRIBUTION (raw, before mapping)
+- Score 0.0: 122
+- Score 1.0: 116
+- Score 2.0: 615
+- Score 3.0: 2,525
+- Score 4.0: 10,493
+- NaN: 5,848
+- Imbalance ratio (most common / rarest): 220x (score 4 vs score 0)
+
+RUBRIC STRUCTURE (from rubric.tsv)
+- The NEE rubric only defines THREE anchor points: 0, 2, and 4
+- Score 0 = none / little / no effort
+- Score 2 = vague / minimal / limited
+- Score 4 = extensive / full / ample and clear
+- Scores 1 and 3 are NOT defined in the rubric
+- Supervisors are using 1 and 3 as interpolations between anchors
+- This is itself a finding: supervisors are misapplying the rubric scale
+- The instrument is ordinal with three levels, not a 5-point scale
+
+RUBRIC ELEMENTS (from rubric.tsv + BIP Process Organizer PDF)
+- 7 elements total, each measuring a different aspect of the BIP
+- Element 1: Leadership involvement of the principal in BIP development
+- Element 2: Collaborative process and stakeholder involvement
+- Element 3: Alignment of BIP objectives to CSIP district goals
+- Element 4: Use of measurable baseline data
+- Element 5: Use of research-based implementation strategies with citations
+- Element 6: Description of monitoring process and corrective actions
+- Element 7: Sharing of BIP results with staff, team, and administration
+- IMPORTANT: Elements 1-5 are NOT supposed to be evaluated for new principals
+  (principals not in position at time of BIP development)
+  Elements 6 and 7 apply to ALL principals
+- Each BIP response in the dataset corresponds to one element, not the whole document
+- Element_numberX column identifies which element each row is scoring
+
+ELEMENT SCORE DISTRIBUTION
+- Element 4 has the highest rate of low scores (most verifiable element)
+- Element 7 also trends lower (concrete sharing evidence required)
+- Elements 1-3 trend higher (narrative, more subjective to evaluate)
+- Element 6 and 7 show more score 0/2 variation than 1-3
+- This is consistent with rubric design: harder elements are more concrete
+
+TOKEN LENGTH ANALYSIS
+- Score 0 BIPs: median 1 token -- essentially empty submissions
+- Score 1 BIPs: median 66 tokens
+- Score 2 BIPs: median 63 tokens
+- Score 3 BIPs: median 90 tokens
+- Score 4 BIPs: median 114 tokens
+- Token count increases with score -- length is a confound
+- Generation prompt must control for length explicitly
+  otherwise model learns to associate length with quality
+- p10 = 65 tokens, p50 = 150 tokens, p90 = 469 tokens, p99 = 1,297 tokens
+- 48% of scored BIPs are under 100 tokens
+- 26.2% of scored BIPs are under 50 tokens (filtered out)
+
+VOCABULARY ANALYSIS
+- Unique tokens in sample: 12,906
+- Type-token ratio overall: 0.0248 (low, expected for domain text)
+- Score 0 TTR: 0.1955 (high -- short texts with diverse words, mostly empty/random)
+- Score 4 TTR: 0.0641 (low -- longer texts with repeated domain vocabulary)
+- Top domain words: students, data, school, team, staff, building, teachers, learning
+- Vocabulary is consistent with educational administration domain
+
+SUBGROUP ANALYSIS FEASIBILITY
+- Districts with >= 30 scored BIPs: 62 out of 156 (viable for subgroup analysis)
+- Districts with >= 10 scored BIPs: 95 out of 156
+- District mean scores range from 2.18 to 4.00 (std = 0.404)
+- This is a large range -- strong signal for the audit analysis
+- One district (87A2EA3F) has mean 3.12 while others cluster at 3.94-4.00
+- run_subgroup_analysis = True is justified
+
+RURALITY FINDINGS
+- Rurality codes present: 11, 12, 13, 21, 23, 31, 32, 33, 41, 42, 43
+- Rurality 13 (most suburban/town): 99.4% score 4
+- Rurality 43 (most rural): 50.7% score 4 -- 37 percentage point gap
+- Rural principals are scored systematically lower across all score levels
+- This is the first concrete audit finding visible in the EDA
+- Rurality must be included as a subgroup variable in the audit regression
+
+TEMPORAL TRENDS
+- Score distribution is stable from 2015-2016 through 2020-2021
+- Mean score jumps from ~3.63 in 2018-2019 to ~3.81 in 2021-2022
+- Mean score reaches ~3.83 in 2022-2023 -- highest in the dataset
+- This upward trajectory after 2021 is suspicious -- potential grade inflation
+- Year must be included as a subgroup variable in the audit regression
+
+prob4_ElementX FIELD
+- dtype: float64, null count matches no_score flag (5,397)
+- Values cluster near 1.0 (median 0.955, mean around 0.97)
+- This is almost certainly a predicted probability of score 4
+  from a prior automated scoring system
+- This field is a pre-existing model signal in the data
+- It can serve as a baseline comparison in the audit
+- It should NOT be used as a training feature for our assessor
+  (would be circular -- we are building an alternative to this)
+
+noconcat FIELD
+- dtype: int64, no nulls
+- 17,647 rows have noconcat = 1, only 2,072 have noconcat = 0
+- no_score rate is similar for both (0.275 vs 0.264) -- not a scoring flag
+- noconcat = 1 likely marks rows where the BIP text is the full concatenated
+  document rather than an element-specific response, or vice versa
+- Needs further investigation before using this field as a filter
+
+SUPERVISOR COMMENT FINDINGS
+- 38.1% of BIPs have a supervisor comment (5,282 out of 13,871 scored)
+- Mean comment length: 23.8 words (short, mostly brief notes)
+- BIPs WITH a comment have lower mean score (3.551) vs WITHOUT (3.741)
+- Supervisors tend to leave comments when they score lower -- makes sense
+- supervisor_commentX is not used in training but is useful metadata
+
+
+================================================================================
+SECTION 2: DECISIONS MADE
+================================================================================
+
+DECISION 1: SCORE MAPPING (1 -> 2, 3 -> 4)
+Reason: The NEE rubric only defines anchor points at 0, 2, and 4.
+Scores 1 and 3 are not rubric-defined levels. They represent supervisors
+interpolating between anchors. To align with the instrument's intent:
+  - Score 1 maps to 2 (supervisor said "not quite minimal" -> minimal)
+  - Score 3 maps to 4 (supervisor said "mostly good" -> exemplary)
+This is documented as a preprocessing decision in the paper.
+After mapping, the three classes are: 0, 2, 4.
+This must be applied in corpus.py before any downstream use.
+
+DECISION 2: THREE-CLASS PROBLEM (0, 2, 4)
+Reason: The rubric defines three levels. After score mapping,
+the natural class structure is Low (0), Minimal (2), Exemplary (4).
+This is more defensible than treating 0-4 as a 5-point scale.
+Post-mapping usable scored counts (approximate, before 50-token filter):
+  - Score 0: ~238 (122 original 0s + 116 mapped from 1)
+  - Score 2: ~750 (615 original 2s + some mapped from 1 depending on choice)
+  - Score 4: ~12,900+ (10,493 original 4s + 2,525 mapped from 3)
+Still heavily imbalanced but the ratio drops from 220x to approximately 54x.
+
+DECISION 3: ELEMENT AS A REQUIRED INPUT FEATURE
+Reason: Each BIP text in the dataset is a response to a specific rubric element.
+The assessor is not scoring "a BIP" generically -- it is scoring Element 3, or
+Element 6, etc. The rubric criteria differ per element. The model must know
+which element it is evaluating.
+Implementation: Element label is prepended to text during preprocessing.
+Format: [Element3] <text content here>
+This applies to style learner training, generation prompts, and assessor training.
+
+DECISION 4: MINIMUM TOKEN FILTER SET AT 50
+Reason: 26.2% of scored BIPs are under 50 tokens. Score 0 BIPs have a median
+of 1 token (empty submissions). These are not meaningful training examples for
+the style learner and would pollute the authenticity signal.
+Applying >= 50 token filter reduces usable corpus from 13,871 to 10,237 scored BIPs.
+For the style learner, all BIPs (scored and unscored) with >= 50 tokens are used:
+13,645 examples.
+
+DECISION 5: DEDUPLICATE BY TEXT FOR STYLE LEARNER TRAINING
+Reason: 25% of texts are duplicates -- same principal writing the same response
+for multiple elements or years. The style learner should not memorize repeated
+content. Deduplication is applied by text before style learner training.
+Note: For anchor sampling (Module 2), duplicates are kept because
+different element-score combinations of the same text are still informative.
+
+DECISION 6: GROUP-BASED TRAIN/TEST SPLIT BY PersonId
+Reason: Every principal appears at least 7 times in the dataset (mean 18 BIPs).
+A random split would put the same principal in both train and test sets,
+causing data leakage. The assessor would be evaluated on principals it has
+already seen, inflating performance estimates.
+All splits must be done at the PersonId level so no principal appears in
+both train and test partitions.
+
+DECISION 7: LENGTH IS A CONFOUND -- MUST CONTROL IN GENERATION
+Reason: Higher scoring BIPs are longer on average (score 0 median = 1 token,
+score 4 median = 114 tokens). If the generation model learns this association,
+it will generate short BIPs for low scores and long BIPs for high scores
+regardless of content quality. The generation prompt must explicitly specify
+a target length range (150-469 tokens, the p50-p90 range) for ALL score levels.
+This prevents length from being a spurious signal in the synthetic pool.
+
+DECISION 8: SUBGROUP ANALYSIS IS VIABLE AND REQUIRED
+Reason: 62 districts have >= 30 scored BIPs, sufficient for regression analysis.
+District mean scores range from 2.18 to 4.00 (std 0.404) -- large variance.
+Rurality shows a 37 percentage point gap between most urban and most rural.
+Temporal trend shows suspicious score inflation post-2021.
+Subgroup variables for audit regression: DistrictID, Rurality, year_num.
+If supervisor-level metadata is available (implicit via DistrictID), include it.
+AuditConfig.run_subgroup_analysis = True.
+
+DECISION 9: prob4_ElementX IS A BASELINE COMPARISON, NOT A TRAINING FEATURE
+Reason: This field contains predicted probabilities from a prior scoring model.
+Using it as a training feature would make our assessor partially dependent on
+that prior model. Instead it serves as a baseline: we compare our assessor's
+predictions against prob4_ElementX predictions on the same BIPs to demonstrate
+whether our approach improves on the existing automated signal.
+This field is excluded from all training inputs.
+
+DECISION 10: GENERATION IS ELEMENT-SPECIFIC
+Reason: Each element has different rubric criteria, different expected vocabulary,
+and different content requirements. Generating "a BIP" without specifying the
+element would produce generic text that does not align with any specific rubric
+dimension. Module 2 generates responses to a specific element at a specific
+score level. The anchor BIP is also filtered to the same element so topical
+diversity is preserved within each element's domain.
+This means the synthetic pool has structure: N examples per (element, score) cell.
+7 elements x 3 score levels = 21 cells to fill.
+
+DECISION 11: ORDINAL LOSS FOR ASSESSOR TRAINING
+Reason: The three classes (0, 2, 4) are ordinal. Predicting 0 when the true
+label is 4 is a larger error than predicting 2 when the true is 4. Standard
+cross-entropy treats all misclassifications equally. An ordinal-aware loss
+penalizes larger ordinal errors more heavily. This is consistent with using
+QWK as the evaluation metric, which also penalizes ordinal distance.
+
+DECISION 12: FOUR TRAINING CONDITIONS (updated from three)
+Reason: After EDA, the imbalance is so severe (220x) that any improvement
+from synthetic data could come from balancing alone rather than data quality.
+To isolate these effects, four conditions are required:
+  - Condition A: Synthetic only (balanced, verified)
+  - Condition B: Real noisy labels (original skewed distribution)
+  - Condition C: Balanced real subset (reweighted/downsampled to match synthetic balance)
+  - Condition D: Hybrid (synthetic + real combined)
+Condition C is the critical control. If A outperforms C, the improvement is
+from synthetic data quality. If they are equal, the contribution is balancing.
+
+
+================================================================================
+SECTION 3: CONFIG VALUES TO UPDATE IN src/utils/config.py
+================================================================================
+
+CorpusConfig:
+  score_column = "Supervisor_Score_x"
+  text_column = "Text"
+  element_column = "Element_numberX"
+  score_levels = [0, 2, 4]              # after mapping
+  min_token_length = 50
+  score_mapping = {1: 2, 3: 4}          # add this field
+
+AnchorSamplerConfig:
+  n_per_level = 500                      # well above rarest post-mapping count
+  balance_scores = True
+  element_aware = True                   # sample anchors per (element, score) cell
+
+GenerationConfig:
+  target_min_tokens = 150               # p50 of real BIP length
+  target_max_tokens = 469               # p90 of real BIP length
+  max_tokens = 600                       # generation budget (p90 + buffer)
+  target_accepted_per_level = 500        # per (element, score) cell
+
+StyleLearnerConfig:
+  max_seq_length = 1553                  # p99 + buffer
+  training_samples_available = 13645     # after 50-token filter, before dedup
+
+AssessorConfig:
+  num_labels = 3                         # classes: 0, 2, 4
+  ordinal_loss = True
+  group_split_column = "PersonId"        # for leakage-free splitting
+
+AuditConfig:
+  run_subgroup_analysis = True
+  subgroup_columns = ["DistrictID", "Rurality", "year_num"]
+  baseline_column = "prob4_ElementX"     # prior model signal for comparison
+
+
+================================================================================
+SECTION 4: OPEN QUESTIONS (not yet decided)
+================================================================================
+
+Q1: noconcat field
+  What does noconcat = 1 mean exactly? Is it a data quality flag or a structural
+  flag? Need to inspect raw data examples where noconcat = 0 vs 1 before
+  deciding whether to filter on it.
+
+Q2: Score 0 after mapping
+  Post-mapping score 0 has ~238 examples (after 50-token filter, likely fewer).
+  This is very small. Should score 0 be kept as a class or merged with score 2
+  into a single "below exemplary" class, making it binary (0+2 vs 4)?
+  Decision deferred until pilot generation reveals how well low-scoring BIPs
+  can be generated with sufficient diversity.
+
+Q3: Elements 1-5 for new principals
+  The BIP form states Elements 1-5 should not be evaluated for new principals.
+  Does the dataset include a flag for whether the principal is new?
+  If yes, these rows should be excluded from assessor training for those elements.
+  Needs investigation in the data.
+
+Q4: supervisor_commentX content
+  Are supervisor comments useful as an additional signal for the rubric judge
+  in Module 3? A rubric judge that also sees the supervisor's comment when
+  assessing alignment might be better calibrated. Deferred to prompt design phase.
