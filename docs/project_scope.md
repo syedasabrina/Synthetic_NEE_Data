@@ -383,6 +383,12 @@ The model is trained exclusively on synthetic data in the primary
 condition; real BIP scores are never used as training labels in this
 condition.
 
+Module 1 -- Qwen2.5-7B    fine-tuned on 12,508 BIPs
+Module 2 -- Gemini 2.0 Flash    prompted with rubric + anchor
+Module 3 check 1 -- Qwen2.5-7B    (Module 1 checkpoint, authenticity)
+Module 3 check 2 -- Gemini 2.0 Flash    (rubric alignment)
+Module 4 -- Qwen2.5-7B    fine-tuned from Module 1 checkpoint
+
 
 ---
 
