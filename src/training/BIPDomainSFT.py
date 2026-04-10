@@ -1,19 +1,17 @@
 from __future__ import annotations
-
 import os
 from pathlib import Path
-
 import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
+    # DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
 )
-
+from transformers import default_data_collator
 from src.utils.config import BIPDomainSFTConfig
 
 
@@ -33,7 +31,7 @@ def setup_model_and_tokenizer(config: BIPDomainSFTConfig):
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype = torch.float16,
+        dtype = torch.float16,
         device_map = "auto",
     )
 
@@ -79,11 +77,12 @@ def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
         report_to="wandb",
         run_name=f"BIPDomainSFT-{config.model_name.split('/')[-1]}",
         seed=config.seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,
         remove_unused_columns=False,
     )
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    
+    # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=8)
+    data_collator = default_data_collator
 
     trainer = Trainer(
         model = model,

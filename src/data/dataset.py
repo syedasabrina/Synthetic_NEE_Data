@@ -5,29 +5,28 @@ from transformers import PreTrainedTokenizer
 
 
 def make_clm_dataset(df: pd.DataFrame, tokenizer: PreTrainedTokenizer, 
-                     text_col: str = "text_with_prefix", max_length: int = 1553) -> Dataset:
-    """
-    Converts a DataFrame of BIP texts into a tokenized HuggingFace Dataset
-    ready for causal language model fine-tuning.
+                    text_col: str = "text_with_prefix", max_length: int = 1553) -> Dataset:
 
-    Each example is tokenized and the labels are set equal to the input_ids.
-    This is the standard setup for next-token prediction training.
-    """
-
-    # convert to HuggingFace Dataset first
-    hf_dataset = Dataset.from_pandas(df[[text_col]].reset_index(drop=True))
+    hf_dataset = Dataset.from_pandas(
+        df[[text_col]].reset_index(drop=True)
+    )
 
     def tokenize(batch):
         tokenized = tokenizer(
             batch[text_col],
             truncation=True,
             max_length=max_length,
-            padding=False,       # padding handled by data collator at training time
+            padding="max_length",   # pad all sequences to max_length
         )
-        # for CLM, labels = input_ids
-        # the trainer shifts them internally -- you do not shift here
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        tokenized["labels"] = [list(map(int, l)) for l in tokenized["labels"]]
+        # mask padding tokens in labels so loss is not computed on them
+        labels = []
+        for ids, mask in zip(tokenized["input_ids"], tokenized["attention_mask"]):
+            label = [
+                token_id if mask_val == 1 else -100
+                for token_id, mask_val in zip(ids, mask)
+            ]
+            labels.append(label)
+        tokenized["labels"] = labels
         return tokenized
 
     tokenized_dataset = hf_dataset.map(
