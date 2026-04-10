@@ -150,7 +150,7 @@ minimum token filtering (50 tokens), and deduplication by text:
 | Metric | Value |
 |---|---|
 | Total BIPs before filtering | 19,719 |
-| Usable BIPs (style learner) | 12,508 |
+| Usable BIPs (BIPDomainSFT) | 12,508 |
 | Scored BIPs (anchor pool) | 9,398 |
 | Score 0 anchors | 31 |
 | Score 2 anchors | 406 |
@@ -172,7 +172,7 @@ as a proxy for score.
 Key data quality findings:
 - 25% of rows contain duplicate text, indicating the same BIP response
   was used across multiple elements or years. Deduplication by text
-  is applied for style learner training. The anchor pool retains
+  is applied for BIPDomainSFT training. The anchor pool retains
   element-score pairs separately since the same text scored under
   different elements is informative.
 - 29.7% of BIPs have no supervisor score. These are included in style
@@ -242,7 +242,7 @@ through four-way model comparison and ablation over pipeline components.
 ## Pipeline Overview
 
 
-### Module 1 -- Domain Style Learner
+### Module 1 -- Domain BIPDomainSFT
 
 A small open-source language model (Qwen-2.5-7B or similar) is
 fine-tuned on 12,508 BIP texts using a causal language modeling
@@ -260,7 +260,7 @@ Training data is deduplicated by text. Principal-level grouping is used
 for any validation split to prevent leakage across the same principal's
 responses.
 
-The style learner is drawn from a different model family than the
+The BIPDomainSFT is drawn from a different model family than the
 generator used in Module 2. This architectural diversity is deliberate:
 it reduces the risk that both models share the same systematic biases
 or surface fluency heuristics, which would undermine the independence
@@ -758,7 +758,7 @@ Python script passed as an environment variable.
   Expert pilot review partially addresses this.
 - The 25% duplicate text rate in the raw corpus indicates widespread
   reuse of BIP text across elements and years. Deduplication is
-  applied for style learner training but the underlying reuse pattern
+  applied for BIPDomainSFT training but the underlying reuse pattern
   may affect the diversity of the anchor pool.
 - Length confounding: higher-scoring BIPs are systematically longer.
   Generation prompts explicitly control for length to mitigate this,

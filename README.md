@@ -31,7 +31,7 @@ NEE supervisor-scored corpus.
 │   └── diagnostics/           # pipeline diagnostics
 ├── scripts/                   # CLI entry points
 │   ├── run_generation.py
-│   ├── run_style_learner.py
+│   ├── run_BIPDomainSFT.py
 │   ├── run_assessor.py
 │   ├── run_evaluation.py
 │   ├── run_audit.py
@@ -40,7 +40,7 @@ NEE supervisor-scored corpus.
 │   ├── data/                  # corpus loading, anchor sampling, HF datasets
 │   ├── generation/            # Module 2: rubric-conditioned generator
 │   ├── judges/                # Module 3: authenticity + rubric judges
-│   ├── training/              # Modules 1 & 4: style learner + assessor
+│   ├── training/              # Modules 1 & 4: BIP Domain SFT + assessor
 │   ├── evaluation/            # metrics, calibration, difficulty, error analysis
 │   ├── audit/                 # deviation scoring, statistical tests, subgroup
 │   └── utils/                 # config dataclasses, logging, io, embeddings
@@ -56,7 +56,7 @@ NEE supervisor-scored corpus.
 ```
 18k real BIPs
     │
-    ├──► [Module 1] Fine-tune small LM (style learner)
+    ├──► [Module 1] Fine-tune small LM (BIP Domain SFT)
     │         └──► authenticity judge (Module 3, Check 1)
     │
     └──► anchor pool (score-balanced sampling)
@@ -136,8 +136,8 @@ bash setup_repo.sh
 ## Running the Pipeline
 
 <!-- ```bash
-# 1. train style learner (Module 1)
-python scripts/run_style_learner.py
+# 1. train BIP Domain SFT (Module 1)
+python scripts/run_BIPDomainSFT.py
 
 # 2. generate + judge synthetic BIPs (Modules 2 & 3)
 python scripts/run_generation.py
