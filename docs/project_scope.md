@@ -150,7 +150,7 @@ minimum token filtering (50 tokens), and deduplication by text:
 | Metric | Value |
 |---|---|
 | Total BIPs before filtering | 19,719 |
-| Usable BIPs (BIPDomainSFT) | 12,508 |
+| Usable BIPs (BIPDomainSFT training) | 12,508 |
 | Scored BIPs (anchor pool) | 9,398 |
 | Score 0 anchors | 31 |
 | Score 2 anchors | 406 |
@@ -175,8 +175,8 @@ Key data quality findings:
   is applied for BIPDomainSFT training. The anchor pool retains
   element-score pairs separately since the same text scored under
   different elements is informative.
-- 29.7% of BIPs have no supervisor score. These are included in style
-  learner training but excluded from the anchor pool.
+- 29.7% of BIPs have no supervisor score. These are included in
+  BIPDomainSFT training but excluded from the anchor pool.
 - All principals have multiple BIPs (mean 18.2, min 7). Train and
   validation splits use principal-level grouping to prevent leakage.
 
@@ -206,10 +206,10 @@ generation architecture with independent dual-channel verification,
 combined with its application to surfacing systematic scoring deviations
 in a real principal assessment corpus. Specifically:
 
-- A domain-fine-tuned small language model is repurposed as an
-  authenticity judge, leveraging its learned prior over 12,508 real BIP
-  documents to detect out-of-distribution synthetic text -- a role
-  distinct from its training objective.
+- A domain-fine-tuned small language model (BIPDomainSFT) is
+  repurposed as an authenticity judge, leveraging its learned prior
+  over 12,508 real BIP documents to detect out-of-distribution
+  synthetic text -- a role distinct from its training objective.
 
 - A rubric-conditioned generation model produces score-targeted BIPs
   anchored to real BIP topics, separating content diversity (sourced
@@ -239,16 +239,34 @@ through four-way model comparison and ablation over pipeline components.
 ---
 
 
+## Model Assignment
+
+| Module | Model | Role |
+|---|---|---|
+| Module 1 | Qwen2.5-7B | BIPDomainSFT -- fine-tuned on 12,508 BIPs via causal LM |
+| Module 2 | Gemini 2.0 Flash | Rubric-conditioned generator -- prompted with rubric + anchor |
+| Module 3 Check 1 | Qwen2.5-7B (Module 1 checkpoint) | Authenticity judge |
+| Module 3 Check 2 | Gemini 2.0 Flash | Rubric alignment judge |
+| Module 4 | Qwen2.5-7B (from Module 1 checkpoint) | Final assessor -- classification fine-tune |
+
+Qwen and Gemini are from architecturally distinct families (Alibaba vs
+Google). This separation is deliberate and satisfies the dual-model
+independence requirement for the verification pipeline.
+
+
+---
+
+
 ## Pipeline Overview
 
 
-### Module 1 -- Domain BIPDomainSFT
+### Module 1 -- BIPDomainSFT
 
-A small open-source language model (Qwen-2.5-7B or similar) is
-fine-tuned on 12,508 BIP texts using a causal language modeling
-objective. Scores are not used at this stage. The model learns authentic
-BIP writing patterns: principal voice, improvement plan vocabulary,
-structural conventions, and typical document length per element.
+Qwen2.5-7B is fine-tuned on 12,508 BIP texts using a causal language
+modeling objective. Scores are not used at this stage. The model learns
+authentic BIP writing patterns: principal voice, improvement plan
+vocabulary, structural conventions, and typical document length per
+element.
 
 Each training example is prefixed with its element label:
 "Element3: Our building improvement objectives are aligned..."
@@ -260,37 +278,32 @@ Training data is deduplicated by text. Principal-level grouping is used
 for any validation split to prevent leakage across the same principal's
 responses.
 
-The BIPDomainSFT is drawn from a different model family than the
-generator used in Module 2. This architectural diversity is deliberate:
-it reduces the risk that both models share the same systematic biases
-or surface fluency heuristics, which would undermine the independence
-of the dual verification step.
+BIPDomainSFT is drawn from a different model family than the generator
+used in Module 2. This architectural diversity is deliberate: it reduces
+the risk that both models share the same systematic biases or surface
+fluency heuristics, which would undermine the independence of the dual
+verification step.
 
 This model serves two purposes: it is the primary authenticity judge
-in Module 3, and an alternative generator condition in ablation
-studies.
+in Module 3, and an alternative generator condition in ablation studies.
 
-Fine-tuning is performed with LoRA/PEFT on a single A100 80GB GPU
-on the Hopper HPC cluster. Training uses the HuggingFace Transformers
-and PEFT libraries. Full fine-tune via Accelerate/DeepSpeed is
-explored as an ablation if compute budget allows.
+Fine-tuning is performed with LoRA/PEFT on a single A100 80GB GPU on
+the Hopper HPC cluster using HuggingFace Transformers and PEFT.
 
 
 ### Module 2 -- Rubric-Conditioned Generator
 
-A capable language model (from a different family than Module 1)
-receives a structured prompt comprising: (1) the full NEE rubric
-criteria for the target element and score level, (2) a target score
-(0, 2, or 4), (3) the target element label, and (4) a single real BIP
-sampled from the anchor pool as a topical anchor. The model is
-instructed to generate a new BIP response for that element that
-addresses similar improvement themes as the anchor but demonstrates
+Gemini 2.0 Flash receives a structured prompt comprising: (1) the full
+NEE rubric criteria for the target element and score level, (2) a
+target score (0, 2, or 4), (3) the target element label, and (4) a
+single real BIP sampled from the anchor pool as a topical anchor. The
+model is instructed to generate a new BIP response for that element
+that addresses similar improvement themes as the anchor but demonstrates
 competencies at the specified score level.
 
 One real BIP is used as anchor per generation, providing natural
 topical diversity across the synthetic pool without requiring manually
-curated seeds. Because each principal has responses across all seven
-elements, anchors are sampled at the element level to ensure each
+curated seeds. Anchors are sampled at the element level to ensure each
 generated BIP is conditioned on an element-appropriate real response.
 
 Score distribution in anchor sampling is intentionally non-uniform:
@@ -321,24 +334,23 @@ Every candidate synthetic BIP is evaluated on two independent axes
 before entering the training pool.
 
 **Check 1: Authenticity**
-The fine-tuned domain model from Module 1 receives the candidate BIP
-alongside several real BIP examples for the same element as in-context
-references. It is prompted to assess whether the candidate is
-consistent with the writing style, structure, and language patterns
-of authentic principal-authored BIPs for that element. The model's
-domain-specific prior -- trained on 12,508 real examples -- provides
-a stronger authenticity signal than a general-purpose model would.
-Because Module 1 and Module 2 are from different model families, the
-authenticity check is not trivially passed by fluent outputs of the
-generator.
+BIPDomainSFT receives the candidate BIP alongside several real BIP
+examples for the same element as in-context references. It is prompted
+to assess whether the candidate is consistent with the writing style,
+structure, and language patterns of authentic principal-authored BIPs
+for that element. The model's domain-specific prior -- trained on
+12,508 real examples -- provides a stronger authenticity signal than
+a general-purpose model would. Because BIPDomainSFT and the generator
+are from different model families, the authenticity check is not
+trivially passed by fluent outputs of the generator.
 
 **Check 2: Rubric Alignment**
-A model from a separate configuration receives the NEE rubric criteria
-for the target element, the intended target score, and the candidate
-BIP. It is prompted to independently score the BIP according to the
-rubric and assess whether its score agrees with the intended label.
-Candidates where the model-assigned score disagrees with the intended
-score by more than one rubric level are rejected.
+Gemini 2.0 Flash receives the NEE rubric criteria for the target
+element, the intended target score, and the candidate BIP. It is
+prompted to independently score the BIP according to the rubric and
+assess whether its score agrees with the intended label. Candidates
+where the model-assigned score disagrees with the intended score by
+more than one rubric level are rejected.
 
 **Verdict and Loop**
 Both checks must pass for a candidate to enter the training pool.
@@ -367,10 +379,12 @@ diagnostics.
 
 The accepted synthetic BIPs, each paired with a verified element label
 and score label, form the supervised training dataset for the final
-assessor model. This is a text classification fine-tuning task: a
-pretrained language model with a classification head is trained to
-predict the NEE rubric score (0, 2, or 4) given a BIP text and element
-label as input.
+assessor model. This is a text classification fine-tuning task:
+Qwen2.5-7B initialized from the BIPDomainSFT checkpoint is trained
+with a classification head to predict the NEE rubric score (0, 2,
+or 4) given a BIP text and element label as input. Starting from the
+BIPDomainSFT checkpoint means the assessor already has domain writing
+knowledge baked in before classification training begins.
 
 **Ordinal modeling:** The ordinal nature of the scoring scale is
 handled explicitly using one of the following (selected after pilot):
@@ -382,12 +396,6 @@ Reporting uses QWK as the primary metric throughout.
 The model is trained exclusively on synthetic data in the primary
 condition; real BIP scores are never used as training labels in this
 condition.
-
-Module 1 -- Qwen2.5-7B    fine-tuned on 12,508 BIPs
-Module 2 -- Gemini 2.0 Flash    prompted with rubric + anchor
-Module 3 check 1 -- Qwen2.5-7B    (Module 1 checkpoint, authenticity)
-Module 3 check 2 -- Gemini 2.0 Flash    (rubric alignment)
-Module 4 -- Qwen2.5-7B    fine-tuned from Module 1 checkpoint
 
 
 ---
@@ -751,7 +759,7 @@ Python script passed as an environment variable.
 - Score 0 is severely underrepresented (31 anchors). Synthetic
   generation at this level is limited in diversity and all score-0
   findings are reported with this constraint explicit.
-- Authenticity as measured by Module 1 reflects writing style
+- Authenticity as measured by BIPDomainSFT reflects writing style
   consistency, not factual accuracy or pedagogical soundness. A BIP
   can be authentic in style and rubric-aligned but describe
   improvement plans that are unrealistic or educationally unsound.
@@ -811,7 +819,7 @@ evaluation of school principals. Several ethical considerations apply:
 ## Project Outputs
 
 ### Artifacts
-- Trained domain style model (Module 1 fine-tune checkpoint).
+- BIPDomainSFT checkpoint (Qwen2.5-7B fine-tuned on 12,508 BIPs).
 - Synthetic BIP dataset with verified score and element labels,
   accept/reject logs, anchor similarity scores, and per-candidate
   judge verdicts.
