@@ -32,7 +32,7 @@ def setup_model_and_tokenizer(config: BIPDomainSFTConfig):
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         dtype = torch.float16,
-        device_map = "auto",
+        device_map = {"":0},
     )
 
     # apply LoRA
@@ -69,7 +69,8 @@ def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         warmup_ratio=config.warmup_ratio,
-        fp16=config.fp16,
+        fp16=False,
+        bf16=True,
         logging_dir=config.log_dir,
         logging_steps=50,
         save_strategy="epoch",
