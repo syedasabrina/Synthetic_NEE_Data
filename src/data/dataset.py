@@ -1,11 +1,16 @@
 from __future__ import annotations
+
 import pandas as pd
 from datasets import Dataset
 from transformers import PreTrainedTokenizer
 
 
-def make_clm_dataset(df: pd.DataFrame, tokenizer: PreTrainedTokenizer, 
-                    text_col: str = "text_with_prefix", max_length: int = 1553) -> Dataset:
+def make_clm_dataset(
+    df: pd.DataFrame,
+    tokenizer: PreTrainedTokenizer,
+    text_col: str = "text_with_prefix",
+    max_length: int = 1553,
+) -> Dataset:
 
     hf_dataset = Dataset.from_pandas(
         df[[text_col]].reset_index(drop=True)
@@ -16,23 +21,19 @@ def make_clm_dataset(df: pd.DataFrame, tokenizer: PreTrainedTokenizer,
             batch[text_col],
             truncation=True,
             max_length=max_length,
-            padding="max_length",   # pad all sequences to max_length
+            padding="max_length",
         )
-        # mask padding tokens in labels so loss is not computed on them
-        labels = []
-        for ids, mask in zip(tokenized["input_ids"], tokenized["attention_mask"]):
-            label = [
-                token_id if mask_val == 1 else -100
-                for token_id, mask_val in zip(ids, mask)
-            ]
-            labels.append(label)
-        tokenized["labels"] = labels
+        tokenized["labels"] = [
+            [-100 if t == tokenizer.pad_token_id else t for t in ids]
+            for ids in tokenized["input_ids"]
+        ]
         return tokenized
 
     tokenized_dataset = hf_dataset.map(
         tokenize,
         batched=True,
         remove_columns=[text_col],
+        load_from_cache_file=False,
     )
 
     return tokenized_dataset
@@ -61,5 +62,5 @@ if __name__ == "__main__":
     print(f"\nDataset size: {len(dataset):,} examples")
     print(f"Features: {dataset.features}")
     print(f"\nFirst example input_ids length: {len(dataset[0]['input_ids'])}")
-    print(f"First example decoded preview:")
+    print(f"Labels length: {len(dataset[0]['labels'])}")
     print(tokenizer.decode(dataset[0]['input_ids'][:50]))

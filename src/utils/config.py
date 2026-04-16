@@ -127,7 +127,8 @@ class BIPDomainSFTConfig:
     # from EDA: p99=1297 tokens + 256 buffer, capped at 4096
     max_seq_length: int = 1553
     lora: LoRAConfig = field(default_factory=LoRAConfig)
-    fp16: bool = True
+    fp16: bool = False
+    bf16: bool = True
     log_dir: str = "logs/BIPDomainSFT"
     seed: int = 42
 

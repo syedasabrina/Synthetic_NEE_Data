@@ -1,17 +1,20 @@
 from __future__ import annotations
+
 import os
 from pathlib import Path
+
 import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    # DataCollatorForLanguageModeling,
+    DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
+    default_data_collator,
 )
-from transformers import default_data_collator
+
 from src.utils.config import BIPDomainSFTConfig
 
 
@@ -28,21 +31,19 @@ def setup_model_and_tokenizer(config: BIPDomainSFTConfig):
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"Loading model: {config.model_name}")
-
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        dtype = torch.float16,
-        device_map = {"":0},
+        dtype=torch.bfloat16,
+        device_map="auto",
     )
 
-    # apply LoRA
     lora_config = LoraConfig(
-        task_type= TaskType.CAUSAL_LM,
+        task_type=TaskType.CAUSAL_LM,
         r=config.lora.r,
-        lora_alpha= config.lora.lora_alpha,
-        target_modules= config.lora.target_modules,
-        bias= config.lora.bias,
-        lora_dropout= config.lora.lora_dropout
+        lora_alpha=config.lora.lora_alpha,
+        target_modules=config.lora.target_modules,
+        bias=config.lora.bias,
+        lora_dropout=config.lora.lora_dropout,
     )
 
     model = get_peft_model(model, lora_config)
@@ -51,7 +52,11 @@ def setup_model_and_tokenizer(config: BIPDomainSFTConfig):
     return model, tokenizer
 
 
-def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
+def train(
+    config: BIPDomainSFTConfig,
+    dataset: Dataset,
+    tokenizer=None,
+) -> None:
     """
     Fine-tunes Qwen on the BIP corpus using causal language modeling.
     Saves the LoRA adapter checkpoint to config.output_dir.
@@ -60,7 +65,12 @@ def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
     os.makedirs(config.output_dir, exist_ok=True)
     os.makedirs(config.log_dir, exist_ok=True)
 
-    model, tokenizer = setup_model_and_tokenizer(config)
+    model, _tokenizer = setup_model_and_tokenizer(config)
+
+    # use the tokenizer passed in from __main__ if available
+    # this avoids creating two separate tokenizer instances
+    if tokenizer is None:
+        tokenizer = _tokenizer
 
     training_args = TrainingArguments(
         output_dir=config.output_dir,
@@ -69,6 +79,7 @@ def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         warmup_ratio=config.warmup_ratio,
+        max_grad_norm=1.0,
         fp16=False,
         bf16=True,
         logging_dir=config.log_dir,
@@ -81,15 +92,21 @@ def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
         dataloader_num_workers=2,
         remove_unused_columns=False,
     )
-    
-    # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=8)
+
     data_collator = default_data_collator
 
+    # data_collator = DataCollatorForLanguageModeling(
+    #     tokenizer=tokenizer,
+    #     mlm=False,
+    #     pad_to_multiple_of=8,
+    #     return_tensors="pt",
+    # )
+
     trainer = Trainer(
-        model = model,
-        args = training_args,
-        train_dataset= dataset,
-        data_collator= data_collator,
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=data_collator,
     )
 
     print("Starting BIPDomainSFT training...")
@@ -99,7 +116,6 @@ def train(config: BIPDomainSFTConfig, dataset: Dataset) -> None :
     model.save_pretrained(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
     print("Done.")
-
 
 
 if __name__ == "__main__":
@@ -118,7 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--smoke_test", action="store_true",
-                        help="Run 5 steps only to verify pipeline works")
+                        help="Run on 50 examples for 1 epoch to verify pipeline")
     args = parser.parse_args()
 
     config = BIPDomainSFTConfig(
@@ -134,16 +150,19 @@ if __name__ == "__main__":
     print(f"Training examples: {len(sl_df):,}")
 
     print("Tokenizing dataset...")
-    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = make_clm_dataset(sl_df, tokenizer, max_length=config.max_seq_length)
+    dataset = make_clm_dataset(
+        sl_df,
+        tokenizer,
+        max_length=512 if args.smoke_test else config.max_seq_length,
+    )
 
     if args.smoke_test:
         print("Smoke test mode -- truncating to 50 examples")
         dataset = dataset.select(range(50))
         config.num_train_epochs = 1
 
-    train(config, dataset)
+    train(config, dataset, tokenizer=tokenizer)
