@@ -1,17 +1,17 @@
 # Project Scope
 
-## Project Title (Loosely)
-Rubric-Aligned Synthetic BIP Generation with Dual-Model Verification
-for Principal Assessment Auditing
+## Project Title
+Reinforcement Learning from Rubric Feedback: Authentic Synthetic BIP
+Generation for Principal Assessment Auditing
 
 
 ## One-Line Summary
-A synthetic data generation pipeline that produces rubric-aligned,
-authenticity-verified Building Improvement Plans (BIPs) to train and
-evaluate an LLM-based proxy for rubric-consistent scoring -- validated
-through four-way model comparison, ablation studies, and applied to
-detecting systematic scoring deviations in the real supervisor-assessed
-corpus.
+A synthetic data generation pipeline that uses RLHF to train a
+generator producing rubric-aligned, authentically-written Building
+Improvement Plans (BIPs) -- optimizing simultaneously for rubric
+consistency and principal writing style -- to train and evaluate an
+LLM-based proxy for detecting systematic scoring deviations in the
+real supervisor-assessed corpus.
 
 
 ---
@@ -20,26 +20,43 @@ corpus.
 ## Motivation and Problem Statement
 
 Evaluating school principal performance through Building Improvement
-Plans (BIPs) is a high-stakes process governed by the NEE rubric. Prior
-analysis of the existing corpus of supervisor-assigned BIP scores reveals
-systematic skew and inter-rater bias, undermining the reliability of
-those scores as ground truth. A robust automated reference for auditing
-these scores requires high-quality labeled training data -- data that does
-not currently exist in sufficient quantity or quality.
+Plans (BIPs) is a high-stakes process governed by the NEE rubric.
+Prior analysis of the existing corpus of supervisor-assigned BIP scores
+reveals systematic skew and inter-rater bias, undermining the
+reliability of those scores as ground truth. A robust automated
+reference for auditing these scores requires high-quality labeled
+training data -- data that does not currently exist in sufficient
+quantity or quality.
 
-The core challenge is a data scarcity problem with a compound constraint:
-the 18,000+ real BIPs in the corpus carry authentic writing but unreliable
-scores, while the 23 expert-adjudicated gold standard BIPs carry reliable
-scores but are too few to train on. This project resolves that tension by
-generating a large pool of synthetic BIPs that are simultaneously
-rubric-aligned and authentically written, using a two-model pipeline with
-independent verification.
+The core challenge is a data scarcity problem with a compound
+constraint: the 18,000+ real BIPs in the corpus carry authentic
+writing but unreliable scores, while the 23 expert-adjudicated gold
+standard BIPs carry reliable scores but are too few to train on.
 
-The central research question is not only whether such a pipeline can be
-built, but whether an assessor trained on its outputs can detect systematic
-scoring deviations in the real supervisor-assigned corpus that are
-consistent with patterns of evaluator inconsistency -- producing a finding
-of direct educational policy relevance.
+This project addresses this tension through two key observations:
+
+First, the real BIP corpus contains high-quality human-authored text
+that reflects genuine principal writing patterns -- vocabulary,
+sentence structure, domain conventions, and topical diversity -- even
+though the scores assigned to this text by supervisors are unreliable.
+
+Second, the NEE rubric provides a reliable specification of what each
+score level looks like for each element, independent of any supervisor
+judgment.
+
+The pipeline exploits both observations separately and then combines
+them through RLHF: a domain language model learns authentic writing
+style from the real corpus without ever seeing scores, and a rubric-
+conditioned generator is trained via reinforcement learning to optimize
+simultaneously for rubric alignment (from the rubric specification) and
+authentic style (from the domain language model), never relying on
+noisy supervisor scores as a training signal.
+
+The central research question is not only whether such a pipeline can
+be built, but whether an assessor trained on its outputs can detect
+systematic scoring deviations in the real supervisor-assigned corpus
+that are consistent with patterns of evaluator inconsistency --
+producing a finding of direct educational policy relevance.
 
 
 ---
@@ -47,23 +64,25 @@ of direct educational policy relevance.
 
 ## Framing: Assessor as Proxy, Not Ground Truth
 
-A core framing commitment of this project is that the trained assessor is
-a proxy for rubric-consistent scoring, not an oracle and not a replacement
-for expert judgment. This distinction governs how the audit findings are
-interpreted.
+A core framing commitment of this project is that the trained assessor
+is a proxy for rubric-consistent scoring, not an oracle and not a
+replacement for expert judgment. This distinction governs how the
+audit findings are interpreted.
 
 When the assessor disagrees with a supervisor score, that disagreement
-does not establish that the supervisor is wrong. It establishes that the
-supervisor's score is inconsistent with the rubric-aligned predictions of
-a model trained on verified synthetic data. Two sources of error exist:
-supervisor inconsistency and model miscalibration. The project's evaluation
-design is explicitly structured to characterize both.
+does not establish that the supervisor is wrong. It establishes that
+the supervisor's score is inconsistent with the rubric-aligned
+predictions of a model trained on verified synthetic data. Two sources
+of error exist: supervisor inconsistency and model miscalibration.
+The project's evaluation design is explicitly structured to
+characterize both.
 
-Consequently, audit findings are reported as systematic scoring deviations
-rather than bias. The term bias is reserved for deviation patterns that
-correlate with identifiable subgroup variables (supervisor identity,
-district, year, school type), where the subgroup correlation itself
-provides additional evidence beyond model disagreement alone.
+Consequently, audit findings are reported as systematic scoring
+deviations rather than bias. The term bias is reserved for deviation
+patterns that correlate with identifiable subgroup variables
+(supervisor identity, district, year, school type), where the subgroup
+correlation itself provides additional evidence beyond model
+disagreement alone.
 
 
 ---
@@ -71,15 +90,15 @@ provides additional evidence beyond model disagreement alone.
 
 ## The NEE Rubric and BIP Structure
 
-The Building Improvement Plan is a structured document completed annually
-by school principals. It is organized into seven elements across three
-sections:
+The Building Improvement Plan is a structured document completed
+annually by school principals. It is organized into seven elements
+across three sections:
 
 Section A -- Role of the Principal in BIP Development:
 - Element 1 (Leadership Role): describes the principal's personal
   involvement in leading BIP development
-- Element 2 (Collaboration): describes the collaborative process used
-  to develop the BIP with building stakeholders
+- Element 2 (Collaboration): describes the collaborative process
+  used to develop the BIP with building stakeholders
 
 Section B -- Major Objectives and Strategies:
 - Element 3 (Goal Alignment): describes alignment of BIP objectives
@@ -201,39 +220,45 @@ Subgroup findings from EDA that motivate the audit analysis:
 
 ## Primary Research Contribution
 
-The novel contribution of this project is the dual-model synthetic data
-generation architecture with independent dual-channel verification,
-combined with its application to surfacing systematic scoring deviations
-in a real principal assessment corpus. Specifically:
+The novel contribution of this project is a reinforcement learning
+from rubric feedback (RLRF) pipeline for synthetic educational
+assessment data generation, combined with its application to
+surfacing systematic scoring deviations in a real principal assessment
+corpus. Specifically:
 
-- A domain-fine-tuned small language model (BIPDomainSFT) is
-  repurposed as an authenticity judge, leveraging its learned prior
-  over 12,508 real BIP documents to detect out-of-distribution
-  synthetic text -- a role distinct from its training objective.
+- BIPDomainSFT (Qwen2.5-7B) is fine-tuned on 12,508 real BIP texts
+  using causal language modeling, learning authentic principal writing
+  style without any score supervision. It serves as a frozen reward
+  model providing authenticity signal during PPO training.
 
-- A rubric-conditioned generation model produces score-targeted BIPs
-  anchored to real BIP topics, separating content diversity (sourced
-  from the real corpus) from score-relevant quality (conditioned on
-  the rubric). Generation is element-aware: each synthetic BIP
-  targets a specific rubric element and score level.
+- A Gemma-2-2B generator is trained via PPO to simultaneously
+  optimize two reward signals: rubric alignment (from a frozen
+  Gemma-2-2B few-shot rubric judge) and writing authenticity (from
+  BIPDomainSFT perplexity). A KL penalty against the SFT warmup
+  checkpoint prevents the generator from drifting into incoherent
+  outputs.
 
-- The two verification channels -- authenticity and rubric alignment --
-  are assigned to architecturally distinct model families with different
-  information access, avoiding self-referential judgment and producing
-  independently auditable accept/reject decisions.
+- By directly optimizing for both objectives, the generator produces
+  BIPs that are rubric-aligned and authentically written by
+  construction rather than by post-hoc filtering. This is a
+  fundamentally stronger claim than generate-then-filter approaches.
+
+- Noisy supervisor scores are never used as a training signal at any
+  stage. The rubric specification provides score-level conditioning;
+  the real corpus provides style conditioning. These two signals
+  are kept separate and combined only through the reward mechanism.
 
 - The trained assessor is applied to the full real BIP corpus to
   surface systematic deviations between supervisor scores and
-  rubric-predicted scores, with formal statistical testing to distinguish
-  structured deviation from random noise.
+  rubric-predicted scores, with formal statistical testing to
+  distinguish structured deviation from random noise.
 
-Synthetic data generation for educational assessment has been explored
-in prior work, but the combination of element-aware topic anchoring
-from a real corpus, dual-model independent verification across
-architecturally diverse models, difficulty calibration analysis, and
-application to principal-level performance rubric auditing has not been
-attempted in the literature. The contribution is empirically validated
-through four-way model comparison and ablation over pipeline components.
+Synthetic data generation for educational assessment via RLHF has not
+been attempted in the literature. The combination of domain-specific
+style reward modeling, rubric-conditioned generation, element-aware
+anchor conditioning, and application to principal-level performance
+auditing constitutes a novel contribution validated through four-way
+model comparison, ablation studies, and a corpus-level deviation audit.
 
 
 ---
@@ -241,17 +266,20 @@ through four-way model comparison and ablation over pipeline components.
 
 ## Model Assignment
 
-| Module | Model | Role |
-|---|---|---|
-| Module 1 | Qwen2.5-7B | BIPDomainSFT -- fine-tuned on 12,508 BIPs via causal LM |
-| Module 2 | Gemini 2.0 Flash | Rubric-conditioned generator -- prompted with rubric + anchor |
-| Module 3 Check 1 | Qwen2.5-7B (Module 1 checkpoint) | Authenticity judge |
-| Module 3 Check 2 | Gemini 2.0 Flash | Rubric alignment judge |
-| Module 4 | Qwen2.5-7B (from Module 1 checkpoint) | Final assessor -- classification fine-tune |
+| Role | Model | Family | Notes |
+|---|---|---|---|
+| BIPDomainSFT | Qwen2.5-7B | Alibaba | Fine-tuned on 12,508 BIPs. Frozen during PPO. |
+| Authenticity reward | Qwen2.5-7B (BIPDomainSFT) | Alibaba | Perplexity signal. Frozen. |
+| Generator (SFT warmup) | Gemma-2-2B | Google | SFT on anchor BIPs without score conditioning. |
+| Generator (PPO) | Gemma-2-2B | Google | PPO-trained to maximize combined reward. |
+| Rubric alignment reward | Gemma-2-2B | Google | Frozen inference. Few-shot rubric judge. |
+| Final assessor | Qwen2.5-7B | Alibaba | From BIPDomainSFT checkpoint. Classification head. |
 
-Qwen and Gemini are from architecturally distinct families (Alibaba vs
-Google). This separation is deliberate and satisfies the dual-model
-independence requirement for the verification pipeline.
+Qwen (Alibaba) and Gemma (Google) are from architecturally distinct
+families. BIPDomainSFT and the generator never share weights or
+gradients. The rubric judge and generator share the same base model
+family but diverge during PPO -- the judge is always frozen. This
+separation satisfies the dual-model independence requirement.
 
 
 ---
@@ -260,142 +288,253 @@ independence requirement for the verification pipeline.
 ## Pipeline Overview
 
 
-### Module 1 -- BIPDomainSFT
+### Stage 1 -- BIPDomainSFT (COMPLETE)
 
 Qwen2.5-7B is fine-tuned on 12,508 BIP texts using a causal language
-modeling objective. Scores are not used at this stage. The model learns
-authentic BIP writing patterns: principal voice, improvement plan
-vocabulary, structural conventions, and typical document length per
-element.
+modeling objective. Scores are not used. The model learns authentic
+BIP writing patterns across all seven elements. Each training example
+is prefixed with its element label so the model learns element-aware
+style priors.
 
-Each training example is prefixed with its element label:
-"Element3: Our building improvement objectives are aligned..."
-This element-conditioning costs nothing extra and gives the model
-element-aware style priors that improve its reliability as an
-authenticity judge in Module 3.
+Training used LoRA (r=16) on a single A100 80GB GPU for 3 epochs.
+Final training loss: 2.198. Novel generation confirmed: all sampled
+phrases from a held-out generation test returned zero matches in the
+training corpus. Checkpoint saved at models/BIPDomainSFT.
 
-Training data is deduplicated by text. Principal-level grouping is used
-for any validation split to prevent leakage across the same principal's
-responses.
-
-BIPDomainSFT is drawn from a different model family than the generator
-used in Module 2. This architectural diversity is deliberate: it reduces
-the risk that both models share the same systematic biases or surface
-fluency heuristics, which would undermine the independence of the dual
-verification step.
-
-This model serves two purposes: it is the primary authenticity judge
-in Module 3, and an alternative generator condition in ablation studies.
-
-Fine-tuning is performed with LoRA/PEFT on a single A100 80GB GPU on
-the Hopper HPC cluster using HuggingFace Transformers and PEFT.
+This model is frozen for all subsequent stages and used only as an
+inference-time authenticity reward model.
 
 
-### Module 2 -- Rubric-Conditioned Generator
+### Stage 2 -- Authenticity Reward Model
 
-Gemini 2.0 Flash receives a structured prompt comprising: (1) the full
-NEE rubric criteria for the target element and score level, (2) a
-target score (0, 2, or 4), (3) the target element label, and (4) a
-single real BIP sampled from the anchor pool as a topical anchor. The
-model is instructed to generate a new BIP response for that element
-that addresses similar improvement themes as the anchor but demonstrates
-competencies at the specified score level.
+BIPDomainSFT is used as a frozen reward model providing an
+authenticity signal for PPO training. Given a candidate synthetic BIP,
+the reward is computed as the negative mean per-token log-likelihood
+(perplexity proxy) under BIPDomainSFT, normalized to [0, 1]:
 
-One real BIP is used as anchor per generation, providing natural
-topical diversity across the synthetic pool without requiring manually
-curated seeds. Anchors are sampled at the element level to ensure each
-generated BIP is conditioned on an element-appropriate real response.
+    r_auth = exp(-mean_nll) normalized across the batch
 
-Score distribution in anchor sampling is intentionally non-uniform:
-score 0 anchors are used sparingly to reflect the genuine rarity of
-non-engagement in the real population. Score 2 and score 4 anchors
-are sampled to produce a training distribution that is imbalanced
-in the same direction as reality, but less extreme than the raw
-corpus skew.
+Lower perplexity under BIPDomainSFT means the candidate looks more
+like real principal writing. This signal is computed efficiently by
+running the frozen model in inference mode on each candidate.
 
-**Anchor leakage control:** Each generated BIP is compared against
-its anchor using embedding cosine similarity. Candidates exceeding
-a similarity threshold are rejected and regenerated with a fresh
-anchor. The distribution of anchor-to-synthetic similarity scores
-is reported as a pipeline diagnostic.
-
-**Operational parameters (confirmed after pilot):**
-- Target pool size: scaled per element and score level after pilot
-- Generation temperature: fixed across all runs for reproducibility
-- Stopping criterion: fixed total accepted per element-score cell
-- Prompt variants: tested in pilot; final prompt locked before full run
-- Generation effort: attempts per accepted sample reported by
-  element-score cell to detect diversity degradation
+No additional training is required for this stage.
 
 
-### Module 3 -- LLM-as-Judge (Dual Verification)
+### Stage 3 -- Rubric Alignment Reward Model
 
-Every candidate synthetic BIP is evaluated on two independent axes
-before entering the training pool.
+Gemma-2-2B is used as a frozen few-shot rubric judge. It receives
+a structured prompt containing:
+- The NEE rubric criteria for the target element and score level
+- Three to five gold standard BIP examples at the target score level
+  as in-context demonstrations
+- The candidate synthetic BIP
 
-**Check 1: Authenticity**
-BIPDomainSFT receives the candidate BIP alongside several real BIP
-examples for the same element as in-context references. It is prompted
-to assess whether the candidate is consistent with the writing style,
-structure, and language patterns of authentic principal-authored BIPs
-for that element. The model's domain-specific prior -- trained on
-12,508 real examples -- provides a stronger authenticity signal than
-a general-purpose model would. Because BIPDomainSFT and the generator
-are from different model families, the authenticity check is not
-trivially passed by fluent outputs of the generator.
+It is prompted to predict the rubric score (0, 2, or 4) for the
+candidate. The reward is:
 
-**Check 2: Rubric Alignment**
-Gemini 2.0 Flash receives the NEE rubric criteria for the target
-element, the intended target score, and the candidate BIP. It is
-prompted to independently score the BIP according to the rubric and
-assess whether its score agrees with the intended label. Candidates
-where the model-assigned score disagrees with the intended score by
-more than one rubric level are rejected.
+    r_rubric = 1.0  if predicted score == target score
+               0.5  if predicted score is adjacent (one level away)
+               0.0  if predicted score is far off
 
-**Verdict and Loop**
-Both checks must pass for a candidate to enter the training pool.
-Rejections are logged with a reason code: authenticity failure, rubric
-misalignment, anchor leakage, or both. On rejection, a new anchor is
-sampled from the real corpus and the candidate is regenerated.
-Rejection rate and reason distribution are recorded as pipeline
-diagnostics.
+The gold standard BIPs are used only as few-shot examples here, not
+as training data. This does not constitute use of the gold standard
+set for training -- it is in-context demonstration for a frozen model.
+The 23 gold standard BIPs remain held out for final evaluation.
 
-**Judge Reliability**
-Judge reliability is empirically evaluated, not assumed:
-- Inter-judge agreement: rate at which both judges agree on
-  accept/reject for the same candidate.
-- Human vs judge agreement: a sample of approximately 100 candidates
-  (balanced across accept/reject and score levels) is reviewed by a
-  human evaluator blind to judge verdicts. Human verdicts are compared
-  against each judge independently, producing human-judge agreement
-  rates alongside false positive and false negative estimates per judge.
-- This spot-check is framed explicitly as qualitative validation and
-  directional estimation, not precise error rate quantification.
-Results are reported as judge reliability metrics alongside pipeline
-diagnostics.
+No fine-tuning is performed on Gemma-2-2B for this role.
 
 
-### Module 4 -- Final Assessor Training
+### Stage 4 -- Generator SFT Warmup
 
-The accepted synthetic BIPs, each paired with a verified element label
-and score label, form the supervised training dataset for the final
-assessor model. This is a text classification fine-tuning task:
-Qwen2.5-7B initialized from the BIPDomainSFT checkpoint is trained
-with a classification head to predict the NEE rubric score (0, 2,
-or 4) given a BIP text and element label as input. Starting from the
-BIPDomainSFT checkpoint means the assessor already has domain writing
-knowledge baked in before classification training begins.
+Gemma-2-2B is fine-tuned with supervised learning on the anchor pool
+before PPO training begins. This warmup step is critical: PPO training
+on a cold language model is extremely unstable because the model
+produces incoherent outputs, making reward signal noisy and uninformative.
 
-**Ordinal modeling:** The ordinal nature of the scoring scale is
-handled explicitly using one of the following (selected after pilot):
-ordinal cross-entropy loss with adjacent-score penalty weighting, or
-QWK-optimized training objective. The specific choice is justified in
-the paper against the score distribution of the training data.
-Reporting uses QWK as the primary metric throughout.
+The SFT warmup trains Gemma-2-2B to produce BIP-like text given a
+structured prompt:
 
-The model is trained exclusively on synthetic data in the primary
-condition; real BIP scores are never used as training labels in this
-condition.
+    Input:  [Element: Element3]
+            [Rubric: The principal fully and clearly aligns...]
+            [Anchor: <real BIP text from anchor pool>]
+            Generate a BIP response for this element:
+    Output: <BIP text>
+
+Crucially, target score is NOT part of the input at this stage.
+The warmup only teaches the generator to produce coherent BIP-like
+text given an element and anchor. Score conditioning is introduced
+in PPO training where it is reinforced by the rubric reward signal.
+
+This avoids using noisy supervisor scores as SFT training labels.
+The anchor BIP provides topical grounding; the rubric criteria
+provide structural guidance; no score label is required.
+
+Training uses LoRA on one or two A100 80GB GPUs. The SFT checkpoint
+is saved and used as both the starting point for PPO training and
+the reference model for KL penalty computation.
+
+
+### Stage 5 -- PPO Training
+
+The core RLHF stage. The Gemma-2-2B generator is updated using
+Proximal Policy Optimization (PPO) via the TRL library to maximize
+a combined reward signal from both reward models.
+
+**Input to each PPO step:**
+A prompt sampled from the anchor pool:
+
+    [Element: Element3]
+    [Target Score: 4]
+    [Rubric: The principal fully and clearly aligns BIP objectives
+     to CSIP goals...]
+    [Anchor: <real BIP text>]
+    Generate a BIP response that earns a score of 4 for this element:
+
+**Each PPO step:**
+1. Generator samples a candidate BIP from the prompt
+2. Authenticity reward: r_auth from BIPDomainSFT perplexity
+3. Rubric alignment reward: r_rubric from Gemma-2-2B few-shot judge
+4. Combined reward:
+       r = alpha * r_auth + (1 - alpha) * r_rubric
+       alpha is a hyperparameter tuned during pilot runs (start 0.5)
+5. KL penalty:
+       r_final = r - beta * KL(generator || SFT reference)
+       prevents generator from drifting from coherent BIP writing
+6. PPO updates generator LoRA weights to increase probability of
+   high-reward outputs
+
+**Multi-GPU setup:**
+Generator and authenticity reward model (BIPDomainSFT) run on
+separate GPUs. Rubric reward model (frozen Gemma) runs on a third
+GPU or shares with generator depending on memory budget. Batched
+reward computation using Accelerate for efficiency.
+
+**Checkpointing:**
+PPO checkpoints saved every 500 steps. Training is resumable from
+any checkpoint. Multiple pilot runs with different alpha and beta
+values are submitted as separate slurm jobs before the full run.
+
+**Convergence:**
+Training runs until the combined reward plateaus across 1,000
+consecutive steps or a maximum step budget is reached. The final
+checkpoint is the PPO-trained generator.
+
+
+### Stage 6 -- Generation Run
+
+The PPO-trained generator produces the synthetic BIP pool. For each
+generation:
+1. Sample (element, target score, anchor BIP) from the anchor pool
+2. Generator produces a candidate BIP
+3. Both reward models score the candidate -- scores logged as
+   diagnostics, not as accept/reject filters
+4. Anchor leakage check: embedding cosine similarity between
+   candidate and anchor must fall below threshold (0.85)
+5. Accepted candidates stored with element label, target score,
+   reward scores, and anchor ID
+
+Unlike generate-then-filter pipelines, the PPO-trained generator
+produces high-quality outputs by construction. The reward model
+scoring in this stage is diagnostic rather than gatekeeping -- it
+characterizes the quality of the generated pool rather than
+filtering out failures.
+
+Score distribution in anchor sampling:
+- Score 0: sampled sparingly, reflecting genuine rarity
+- Score 2 and 4: sampled to produce a training distribution
+  imbalanced in the same direction as reality but less extreme
+
+
+### Stage 7 -- Final Assessor Training
+
+The synthetic BIP pool, each example paired with a verified element
+label and target score label, forms the supervised training dataset
+for the final assessor model. Qwen2.5-7B initialized from the
+BIPDomainSFT checkpoint is fine-tuned with a classification head
+to predict the NEE rubric score (0, 2, or 4) given a BIP text and
+element label as input.
+
+Starting from the BIPDomainSFT checkpoint means the assessor already
+has domain writing knowledge before classification training begins.
+
+Ordinal modeling: the ordinal nature of the scoring scale is handled
+explicitly using ordinal cross-entropy loss with adjacent-score
+penalty weighting or QWK-optimized training objective, selected after
+pilot evaluation.
+
+Four training conditions are run in parallel as separate slurm jobs:
+
+Condition A -- Synthetic only (primary): assessor trained on
+PPO-generated synthetic BIPs. This is the main experimental condition.
+
+Condition B -- Real noisy labels (lower-bound baseline): assessor
+trained on real BIPs with supervisor-assigned scores, preserving the
+natural skewed distribution.
+
+Condition C -- Balanced real subset (distribution control): assessor
+trained on a downsampled real BIP subset matched to the synthetic
+pool's score distribution. Isolates distribution balancing effects
+from data quality effects.
+
+Condition D -- Hybrid: assessor trained on synthetic and real BIPs
+combined.
+
+
+---
+
+
+## Ablation Studies
+
+These isolate the contribution of each pipeline component.
+
+**Ablation 1 -- No authenticity reward**
+PPO trained with rubric reward only (alpha = 0). Measures the
+independent contribution of the authenticity reward signal.
+
+**Ablation 2 -- No rubric reward**
+PPO trained with authenticity reward only (alpha = 1). Measures the
+independent contribution of the rubric reward signal.
+
+**Ablation 3 -- SFT warmup only, no PPO**
+Use the SFT warmup generator directly for generation without PPO
+training. Measures the contribution of the RL training step.
+
+**Ablation 4 -- No anchor conditioning**
+PPO trained without real BIP anchors in the prompt (rubric and score
+only). Measures the contribution of topical diversity via anchoring.
+
+**Ablation 5 -- Single model family**
+Replace BIPDomainSFT authenticity reward with a Gemma-based
+perplexity model. Measures the contribution of using architecturally
+distinct families for the two reward signals.
+
+Results across all conditions and ablations are reported in a single
+comparison table evaluated on the 23 gold standard BIPs.
+
+
+---
+
+
+## Job Submission Design
+
+All pipeline stages are submitted as dependent slurm jobs in a single
+submission script. Each job runs automatically when its predecessor
+completes successfully.
+
+```
+JOB1: generator SFT warmup
+JOB2: PPO pilot runs (alpha/beta grid, parallel)
+JOB3: PPO full training (best hyperparameters from JOB2)
+JOB4: generation run
+JOB5-8: assessor training (4 conditions, parallel)
+JOB9: evaluation on gold standard
+JOB10: scoring deviation audit
+```
+
+Jobs 5-8 run in parallel after JOB4. JOB9 waits for all four
+assessors. JOB10 runs last. The full pipeline is submitted once and
+runs to completion without manual intervention.
 
 
 ---
@@ -405,83 +544,9 @@ condition.
 
 | Dataset | Size | Score Quality | Role in Pipeline |
 |---|---|---|---|
-| Real BIP corpus | 19,719 raw / 12,508 usable | Noisy / biased | Module 1 fine-tuning; Module 2 anchor pool; audit target |
-| Synthetic BIP pool | TBD per element-score cell | Verified by judges | Module 4 training (primary condition) |
-| Gold standard BIPs | 23 | Expert-adjudicated | Final evaluation only -- held out from all pipeline stages |
-
-
----
-
-
-## Experimental Conditions and Ablations
-
-
-### Four-Way Model Comparison
-
-The central empirical question is whether training on synthetic data
-generalizes to real BIPs, and whether any observed improvement is
-attributable to data quality or simply to score distribution balancing.
-Four assessor models are trained under identical architecture and
-training procedure, differing only in training data composition, and
-all evaluated on the 23 gold standard BIPs.
-
-**Condition A -- Synthetic only (primary)**
-Assessor trained on synthetic BIPs verified by both judges. This is
-the main experimental condition.
-
-**Condition B -- Real noisy labels (lower-bound baseline)**
-Assessor trained on real BIPs with supervisor-assigned scores,
-preserving the natural skewed distribution. Establishes the floor
-that motivates the project.
-
-**Condition C -- Balanced real subset (distribution control)**
-Assessor trained on a downsampled or reweighted subset of real BIPs
-matched to the synthetic pool's score distribution. This condition
-isolates the effect of distribution balancing from the effect of
-synthetic data quality. If Condition A outperforms Condition C, the
-improvement is attributable to verified synthetic data quality, not
-merely to balancing. If they perform equivalently, the contribution
-reduces to the balancing mechanism, which is itself a finding.
-
-**Condition D -- Hybrid**
-Assessor trained on synthetic and real BIPs combined. Tests whether
-authentic writing signal from real data complements verified labels
-from synthetic data.
-
-Differences in evaluation performance across all four conditions are
-attributable solely to training data composition.
-
-
-### Ablation Studies
-
-These isolate the contribution of each pipeline component and directly
-justify the dual-model architecture claim.
-
-**Ablation 1 -- No authenticity filter**
-Run generation and rubric alignment check only. Accept all
-rubric-passing BIPs regardless of authenticity verdict. Train assessor
-and evaluate. Measures the independent contribution of the
-authenticity check.
-
-**Ablation 2 -- No rubric alignment filter**
-Run generation and authenticity check only. Accept all
-authenticity-passing BIPs regardless of rubric alignment verdict.
-Train assessor and evaluate. Measures the independent contribution
-of the rubric check.
-
-**Ablation 3 -- Single-model self-judge**
-Use the same model for both generation and rubric alignment judging.
-Train assessor and evaluate. Measures the contribution of
-architectural diversity between generator and judge versus a
-self-judging setup.
-
-**Ablation 4 -- No anchor conditioning**
-Generate synthetic BIPs without anchoring to real BIPs (rubric and
-score only, no topical anchor). Train assessor and evaluate. Measures
-the contribution of topical diversity via real corpus anchoring.
-
-Results across all conditions and ablations are reported in a single
-comparison table.
+| Real BIP corpus | 19,719 raw / 12,508 usable | Noisy / biased | BIPDomainSFT training; generator SFT warmup anchors; PPO anchor pool; audit target |
+| Gold standard BIPs | 23 | Expert-adjudicated | Few-shot examples for rubric judge (frozen inference only); final evaluation |
+| Synthetic BIP pool | TBD per element-score cell | PPO-optimized | Stage 7 assessor training (primary condition) |
 
 
 ---
@@ -493,95 +558,53 @@ comparison table.
 ### Primary Metric
 
 Quadratic Weighted Kappa (QWK) between the assessor model's predicted
-scores and expert-assigned scores on the 23 gold standard BIPs. QWK is
-the standard metric for automated rubric scoring tasks and penalizes
-ordinal distance between predictions and true labels.
+scores and expert-assigned scores on the 23 gold standard BIPs.
 
 
 ### Supporting Metrics
 
-- Exact agreement: percentage of BIPs where predicted score exactly
-  matches expert score.
-- Adjacent agreement: percentage of BIPs where predicted score is
-  within one rubric level of expert score.
+- Exact agreement: percentage where predicted score exactly matches
+  expert score.
+- Adjacent agreement: percentage where predicted score is within one
+  rubric level of expert score.
 - Human baseline: inter-rater agreement between NEE supervisors on
-  the same 23 BIPs, providing a human-performance reference point.
-- Bootstrap confidence intervals (1,000 resamples) on QWK to account
-  for the small evaluation set size.
-- Leave-one-out evaluation reported alongside bootstrap CIs to extract
-  maximum signal from 23 examples.
+  the same 23 BIPs.
+- Bootstrap confidence intervals (1,000 resamples) on QWK.
+- Leave-one-out evaluation alongside bootstrap CIs.
 
 
 ### Assessor Calibration Analysis
 
-Beyond aggregate QWK, the assessor's calibration across the scoring
-scale is explicitly characterized on the 23 gold standard BIPs:
-- Directional bias check: does the model systematically over-predict
-  or under-predict relative to expert scores at the corpus level?
-  Reported as mean signed deviation with confidence interval.
-- Score-level calibration: per-level agreement rates to detect whether
-  the model is well-calibrated at some rubric levels but not others.
-- Prediction confidence: entropy or softmax confidence distribution
-  across predictions, used to define a high-confidence subset for
-  the audit analysis.
-
-These calibration results directly inform the interpretation of the
-audit: deviations are reported separately for high-confidence and
-low-confidence predictions, with the high-confidence subset
-constituting the primary evidence.
+- Directional bias check: mean signed deviation with confidence
+  interval.
+- Score-level calibration: per-level agreement rates.
+- Prediction confidence: entropy distribution across predictions,
+  used to define high-confidence subset for audit.
 
 
 ### Difficulty Calibration
 
-Synthetic data may be easier to classify than real BIPs even if
-surface distributions match. This is tested directly:
-- Model confidence (prediction entropy) on synthetic held-out BIPs
-  vs real BIPs from the corpus.
-- Performance gap between held-out synthetic test set and the 23 gold
-  standard BIPs, where a large gap indicates difficulty mismatch.
-Results are reported and interpreted in context of the overall
-findings.
+- Model confidence on synthetic held-out BIPs vs real BIPs.
+- Performance gap between held-out synthetic test set and gold
+  standard BIPs.
 
 
-### Error Analysis
+### PPO Training Diagnostics
 
-Disagreements on the gold standard set are analyzed structurally:
-- Breakdown by score level: does the model systematically over- or
-  under-predict at specific rubric levels?
-- Breakdown by element: does performance differ across the seven
-  rubric elements?
-- Breakdown by BIP length and vocabulary complexity.
-- Qualitative inspection of the highest-confidence errors: cases
-  where the predicted score is far from the expert label.
-- At least five example-based analyses reported in the paper.
-
-
-### Pipeline Diagnostics
-
-- Rejection rate per element-score cell (Module 3 output).
-- Rejection reason distribution (authenticity / rubric / anchor
-  leakage / both).
-- Score distribution of accepted synthetic pool vs real corpus.
-- Anchor-to-synthetic cosine similarity distribution.
-- Generation attempts per accepted sample by element-score cell.
-- Inter-judge agreement rate.
-- Human vs judge agreement rate (spot-check sample).
-- Judge false positive and false negative estimates.
+- Combined reward trajectory across PPO steps.
+- Authenticity reward and rubric reward reported separately.
+- KL divergence from SFT reference across training.
+- Reward model agreement rate: how often both rewards agree on
+  high vs low quality outputs.
 
 
 ### Synthetic Data Distribution Characterization
 
-Accepted synthetic BIPs are characterized against the real corpus on:
 - Length distribution (token count, sentence count).
-- Vocabulary diversity (type-token ratio, out-of-vocabulary rate
-  relative to real corpus vocabulary).
+- Vocabulary diversity (type-token ratio, OOV rate).
 - Structural variation (paragraph count, section presence).
-- Semantic diversity (pairwise cosine distance in embedding space
-  across synthetic pool vs within real corpus).
+- Semantic diversity (pairwise cosine distance in embedding space).
 - N-gram diversity (distinct unigram and bigram ratios).
-
-These metrics are reported as a distribution characterization table
-and used to flag systematic over-uniformity in the synthetic pool.
 
 
 ---
@@ -589,61 +612,36 @@ and used to flag systematic over-uniformity in the synthetic pool.
 
 ## Scoring Deviation Audit: Applying the Assessor to Real BIPs
 
-Once the assessor is trained, validated on the gold standard set, and
-characterized for calibration and difficulty, it is applied to the
-full real BIP corpus. For each BIP, the model produces a
-rubric-predicted score and a confidence estimate. The audit is
-conducted on the full corpus and separately on the high-confidence
-subset.
+Once the assessor is trained, validated, and characterized, it is
+applied to the full real BIP corpus. For each BIP, the model produces
+a rubric-predicted score and a confidence estimate.
 
-**Definition of a meaningful finding:** A meaningful audit finding
-requires that observed deviations between supervisor scores and
-model-predicted scores are (a) statistically non-random at the corpus
-level, (b) structured rather than uniformly distributed across score
-levels, and (c) not fully explained by known assessor miscalibration
-as characterized on the gold standard set.
+**Definition of a meaningful finding:** Observed deviations must be
+(a) statistically non-random at corpus level, (b) structured rather
+than uniformly distributed across score levels, and (c) not fully
+explained by known assessor miscalibration.
 
-**Statistical tests applied:**
-- Mean deviation test: one-sample t-test or bootstrap test of whether
-  mean(supervisor score - model score) is not zero at the corpus level.
+**Statistical tests:**
+- Mean deviation test: bootstrap test of whether
+  mean(supervisor score - model score) is not zero.
 - Distributional shift: Kolmogorov-Smirnov test between supervisor
-  score distribution and model-predicted score distribution.
-- Subgroup analysis: where metadata is available, a regression of
-  deviation on supervisor ID, district, year, and rurality:
+  and model-predicted score distributions.
+- Subgroup regression:
     deviation ~ supervisor_id + district + year + rurality
-  Significant coefficients indicate structured, subgroup-correlated
-  deviation -- the condition under which the term "bias" is used.
 
-The following subgroup patterns are pre-specified as audit targets
-based on EDA findings:
-- District-level variance: 62 districts have at least 30 scored BIPs
-  and are viable for subgroup analysis. District mean scores range
-  from 2.18 to 4.00, making district the primary subgroup variable.
-- Rurality: a 37-point gap in score 4 rates between most urban (87%)
-  and most rural (50%) categories is a pre-specified hypothesis.
-- Temporal trend: mean scores increased sharply from 2021-2022
-  onward; year is included as a regression variable.
-- The prob4_ElementX field (a prior model's predicted probability of
-  score 4) is used as an additional baseline in deviation analysis.
+**Pre-specified audit targets from EDA:**
+- District variance: 62 districts viable for subgroup analysis,
+  mean scores ranging 2.18 to 4.00.
+- Rurality: 37-point gap in score 4 rates between urban and rural.
+- Temporal trend: score inflation from 2021-2022 onward.
+- prob4_ElementX as additional baseline.
 
-**Interpretation scenarios are specified in advance:**
-- No significant deviation: supervisors are scoring consistently with
-  rubric-aligned predictions.
-- Significant deviation, unstructured: high variance but no
-  directional pattern; suggests low reliability rather than
-  systematic inflation or deflation.
-- Significant deviation, directional but not subgroup-correlated:
-  corpus-level inflation or deflation; reported as systematic scoring
-  inconsistency.
-- Significant deviation, subgroup-correlated: scoring patterns differ
-  across supervisors, districts, rurality, or time in ways that cannot
-  be explained by rubric variation alone; reported as potential
-  evaluator bias with specific subgroup effects quantified.
-
-The audit is framed throughout as detecting scoring deviations
-relative to a rubric-consistent proxy, not as establishing ground
-truth. All findings are reported with appropriate uncertainty and
-require human interpretation for policy conclusions.
+**Pre-specified interpretation scenarios:**
+- No significant deviation: consistent scoring.
+- Significant, unstructured: low reliability.
+- Significant, directional, not subgroup-correlated: systematic
+  scoring inconsistency.
+- Significant, subgroup-correlated: potential evaluator bias.
 
 
 ---
@@ -652,57 +650,52 @@ require human interpretation for policy conclusions.
 ## Validation Plan
 
 
-### Pre-Run Pilot
+### PPO Pilot Runs
 
-Before running the full synthetic generation pipeline, a batch of
-30-50 synthetic BIPs per element-score cell is generated and reviewed
-by at least one domain expert (education policy expert or
-NEE-familiar reviewer). The expert assesses: (1) whether BIPs are
-plausibly principal-authored, (2) whether score assignments are
-consistent with the rubric for the specific element, and (3) whether
-the improvement plans described are pedagogically plausible -- not
-merely well-written or rubric-aligned. Pilot results are reported
-alongside quantitative pipeline metrics. Prompt templates are locked
-after the pilot; no further modification occurs during the full run.
+Before the full PPO training run, a grid of pilot runs varying alpha
+(authenticity weight) and beta (KL coefficient) is submitted as
+parallel slurm jobs. Each pilot runs for 1,000 steps. The combination
+producing the highest combined reward with stable KL divergence is
+selected for the full run. Prompt templates are locked after pilots.
 
 
-### Judge Calibration
+### Reward Model Calibration
 
-Both judges are evaluated on the 23 gold standard BIPs before the
-full generation run. Verdicts on known-good examples are recorded to
-confirm calibration. A judge that consistently rejects gold standard
-BIPs indicates miscalibration and requires investigation before
-deployment.
+Both reward models are evaluated on the 23 gold standard BIPs before
+PPO training begins. BIPDomainSFT perplexity scores are computed for
+each gold standard BIP and compared against score level -- lower
+perplexity should correlate with higher scores if the model has
+internalized quality patterns. The Gemma rubric judge is tested on
+the same BIPs and agreement with expert scores is reported. Any
+systematic miscalibration is investigated before PPO training.
 
 
 ### Human Spot-Check
 
-A sample of approximately 100 candidates (balanced across accept/reject
-verdicts and score levels) from the full run is reviewed by a human
-evaluator blind to judge verdicts. Human verdicts are compared against
-each judge independently, producing human-judge agreement rates
-alongside false positive and false negative estimates. This is
-explicitly framed as qualitative validation and directional estimation
-rather than precise error rate quantification.
+A sample of approximately 100 generated BIPs from the PPO-trained
+generator (balanced across elements and score levels) is reviewed by
+a human evaluator. The evaluator assesses: (1) does this sound like
+a principal wrote it, (2) does this BIP warrant the target score
+according to the rubric, (3) is the improvement plan pedagogically
+plausible. Results are reported as qualitative validation alongside
+quantitative reward scores.
 
 
 ### Reproducibility Stance
 
-Exact dataset reproducibility is not claimed: generation model
-non-determinism means the precise synthetic pool cannot be guaranteed
-across hardware or API versions even at low temperature. What is
+Exact dataset reproducibility is not claimed: PPO training has
+stochastic elements and generation involves sampling. What is
 reproducible is pipeline behavior: given the locked prompts, fixed
-temperature, and documented acceptance criteria, the distributional
+random seeds, and documented hyperparameters, the distributional
 properties of the synthetic pool are expected to be stable. All
-generation logs, judge verdicts, and accepted BIPs are archived to
-support this weaker but honest reproducibility claim.
+PPO checkpoints, generation logs, and reward scores are archived.
 
 
 ### Final Evaluation Isolation
 
-The 23 gold standard BIPs are withheld from all pipeline stages
-including pilot review, fine-tuning, and judge calibration. They are
-used only for final assessor evaluation.
+The 23 gold standard BIPs are used only as frozen few-shot examples
+for the rubric judge (inference only, no gradient flow) and for final
+assessor evaluation. They are never used as training data at any stage.
 
 
 ---
@@ -711,14 +704,15 @@ used only for final assessor evaluation.
 ## Compute Environment
 
 All training and inference runs on the GMU Hopper HPC cluster.
-Fine-tuning uses a single NVIDIA A100 80GB GPU via SLURM batch
-submission. Interactive testing uses the normal CPU partition for
-data and preprocessing code, and MIG GPU slices (1g.10gb) for
-smoke tests. The project environment is a Python venv located at
-/scratch/sakter6/bip-env. All code, logs, and outputs are stored
-under /scratch/sakter6/synthetic/Synthetic_NEE_Data. Training jobs
-are submitted via sbatch using a shared slurm script with the target
-Python script passed as an environment variable.
+BIPDomainSFT trained on single A100 80GB. Generator SFT warmup and
+PPO training use multiple A100 80GB GPUs via Accelerate. All four
+assessor conditions run in parallel as separate slurm jobs. The
+project environment is a Python venv at /scratch/sakter6/bip-env.
+All code, logs, and outputs are stored under
+/scratch/sakter6/synthetic/Synthetic_NEE_Data.
+
+Key libraries: HuggingFace Transformers, PEFT, TRL (PPO), Accelerate,
+Datasets, WandB for experiment tracking.
 
 
 ---
@@ -726,20 +720,16 @@ Python script passed as an environment variable.
 
 ## Explicit Non-Goals
 
-- The pipeline does not replace human principal assessment. It surfaces
-  scoring deviations relative to rubric-consistent predictions.
-- The assessor model is not deployed as a scoring tool. It is a
-  research instrument; its predictions are a proxy, not ground truth.
-- The project does not claim that synthetic BIPs are indistinguishable
-  from real BIPs -- only that they pass explicit authenticity and
-  alignment criteria sufficient for training a rubric-consistent proxy.
-- The audit does not adjudicate which score is correct. It surfaces
-  structured deviations; human interpretation and institutional review
-  are required for any policy conclusions.
-- The final assessor is not evaluated on its ability to generalize
-  beyond the NEE rubric domain or beyond the BIP document type.
-- Pedagogical validity of generated BIPs is not claimed beyond expert
-  plausibility checks in the pilot.
+- The pipeline does not replace human principal assessment.
+- The assessor is not deployed as a scoring tool. It is a research
+  instrument; predictions are a proxy, not ground truth.
+- The project does not claim synthetic BIPs are indistinguishable from
+  real BIPs -- only that they optimize for both rubric alignment and
+  authentic style simultaneously.
+- The audit does not adjudicate which score is correct.
+- The assessor is not evaluated beyond the NEE rubric domain.
+- Pedagogical validity of generated BIPs is not claimed beyond human
+  spot-check validation.
 
 
 ---
@@ -748,40 +738,25 @@ Python script passed as an environment variable.
 ## Known Limitations
 
 - The gold standard evaluation set of 23 BIPs is small. Bootstrap CIs
-  and leave-one-out evaluation partially compensate, but assessor
-  calibration claims should be interpreted with this constraint
-  explicit.
-- Circularity risk: the generator and rubric judge reason about the
-  same rubric. Using architecturally distinct model families reduces
-  but does not eliminate the risk that both share systematic rubric
-  interpretation biases. Human spot-checks and expert pilot review
-  are the primary mitigations.
-- Score 0 is severely underrepresented (31 anchors). Synthetic
-  generation at this level is limited in diversity and all score-0
-  findings are reported with this constraint explicit.
-- Authenticity as measured by BIPDomainSFT reflects writing style
-  consistency, not factual accuracy or pedagogical soundness. A BIP
-  can be authentic in style and rubric-aligned but describe
-  improvement plans that are unrealistic or educationally unsound.
-  Expert pilot review partially addresses this.
-- The 25% duplicate text rate in the raw corpus indicates widespread
-  reuse of BIP text across elements and years. Deduplication is
-  applied for BIPDomainSFT training but the underlying reuse pattern
-  may affect the diversity of the anchor pool.
+  and leave-one-out evaluation partially compensate.
+- PPO training instability: reward hacking is possible if the
+  generator finds outputs that game one reward model without genuinely
+  improving. KL penalty and human spot-check are the primary
+  mitigations.
+- The Gemma rubric judge is not fine-tuned -- it relies on few-shot
+  prompting. Its rubric interpretation may diverge from expert
+  interpretation in systematic ways. Reward model calibration on gold
+  standard BIPs characterizes this risk before training.
+- Score 0 is severely underrepresented (31 anchors). Generation and
+  training at this level are limited in diversity.
 - Length confounding: higher-scoring BIPs are systematically longer.
-  Generation prompts explicitly control for length to mitigate this,
-  but residual confounding is possible and is noted in the paper.
-- Judge reliability is estimated via human spot-check on approximately
-  100 candidates. This supports directional conclusions but is not
-  sufficient for precise error rate quantification.
+  Generation prompts explicitly control for length.
 - The audit is correlational. Structured deviations indicate
   inconsistency with rubric-aligned predictions, not causally
   established bias.
-- Subgroup analysis is contingent on metadata completeness. District
-  and rurality metadata are available; supervisor-level ID metadata
-  availability is to be confirmed.
-- Prompt non-determinism: distributional reproducibility is claimed;
-  exact dataset reproducibility is not.
+- Subgroup analysis is contingent on metadata completeness.
+- PPO hyperparameter sensitivity: alpha and beta require pilot tuning.
+  Results may vary across hyperparameter settings.
 
 
 ---
@@ -789,28 +764,18 @@ Python script passed as an environment variable.
 
 ## Ethical Considerations
 
-This project operates in a high-stakes domain -- the performance
-evaluation of school principals. Several ethical considerations apply:
-
-- Misuse risk: the trained assessor could in principle be repurposed
-  as an automated scorer rather than an auditor. This project
-  explicitly does not advocate for automated scoring of principals.
-  The model is a research instrument; deployment decisions require
-  human oversight and institutional review.
-- Fairness: the rurality finding (37-point gap in score 4 rates
-  between urban and rural categories) suggests the corpus may encode
+- Misuse risk: the assessor could be repurposed as an automated scorer.
+  This project does not advocate for automated scoring of principals.
+- Fairness: the rurality finding suggests the corpus may encode
   structural inequities. The audit is designed to surface, not
-  reproduce, such patterns. Rurality is included as an explicit
-  subgroup variable in all deviation analyses.
-- Transparency: all model decisions in the pipeline are logged with
-  evidence. Every accepted synthetic BIP and every assessor prediction
-  is traceable to its inputs and the criteria applied.
-- Principal privacy: the real BIPs are used for model training only.
-  No individual principal is identified in any reported result. Audit
-  findings are reported at the aggregate or subgroup level, not the
-  individual level.
+  reproduce, such patterns.
+- Transparency: all PPO training logs, reward scores, and generation
+  logs are archived and traceable.
+- Principal privacy: no individual principal is identified in any
+  reported result. Audit findings are reported at aggregate or
+  subgroup level only.
 - Scope of claims: results are scoped to the NEE rubric, the specific
-  corpus, and the 2015-2024 time period of the data.
+  corpus, and the 2015-2024 time period.
 
 
 ---
@@ -819,20 +784,21 @@ evaluation of school principals. Several ethical considerations apply:
 ## Project Outputs
 
 ### Artifacts
-- BIPDomainSFT checkpoint (Qwen2.5-7B fine-tuned on 12,508 BIPs).
-- Synthetic BIP dataset with verified score and element labels,
-  accept/reject logs, anchor similarity scores, and per-candidate
-  judge verdicts.
-- Trained assessor model checkpoints for all four training conditions.
-- Full pipeline code, prompt templates, generation logs, and evaluation
-  scripts -- publicly released on GitHub.
+- BIPDomainSFT checkpoint (Qwen2.5-7B, COMPLETE).
+- PPO-trained generator checkpoint (Gemma-2-2B).
+- Synthetic BIP dataset with element labels, target scores, and
+  per-candidate reward scores.
+- Trained assessor checkpoints for all four training conditions.
+- Full pipeline code, prompt templates, PPO training logs, and
+  evaluation scripts -- publicly released on GitHub.
 - Distribution characterization and difficulty calibration reports.
 
 ### Written Output
-- A research paper describing the pipeline architecture, four-way
-  model comparison, ablation results, calibration analysis, and
-  scoring deviation audit findings, targeting an NLP or educational
-  NLP venue (BEA workshop, EMNLP, NAACL, or similar).
-- Detailed pipeline documentation for reproducibility, including all
-  prompt templates, judge calibration logs, and human spot-check
-  protocol.
+- A research paper describing the RLHF pipeline for synthetic
+  educational assessment data generation, four-way model comparison,
+  ablation results, calibration analysis, and scoring deviation audit
+  findings, targeting an NLP or educational NLP venue (BEA workshop,
+  EMNLP, NAACL, or similar).
+- Detailed pipeline documentation for reproducibility including all
+  prompt templates, PPO hyperparameters, reward model calibration
+  logs, and human spot-check protocol.
