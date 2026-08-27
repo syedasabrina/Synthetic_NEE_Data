@@ -42,4 +42,5 @@ cd /scratch/sakter6/synthetic/Synthetic_NEE_Data
 python $SCRIPT $ARGS
 
 
-###sbatch --export=ALL,SCRIPT=scripts/run_BIPDomainSFT.py,ARGS="--data data/raw/bips.csv --model Qwen/Qwen2.5-7B" scripts/train.slurm
+### sbatch --export=ALL,SCRIPT=scripts/run_BIPDomainSFT.py,ARGS="--data data/raw/bips.csv --model Qwen/Qwen2.5-7B" scripts/train.slurm
+### sbatch --export=ALL,SCRIPT=scripts/test_rewards.py,ARGS="" scripts/train.slurm
