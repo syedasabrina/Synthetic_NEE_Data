@@ -3,25 +3,28 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     Gemma4ForConditionalGeneration,
     AutoTokenizer,
+    Trainer,
     TrainingArguments,
-    default_data_collator,
 )
 
 from src.utils.config import GeneratorSFTConfig
 
 
-def build_sft_prompt(element: str, rubric_text: str, anchor_text: str) -> str:
+def build_sft_prompt(element: str, rubric_text: str, reference_text: str) -> str:
     """
-    Builds the SFT training prompt. This teaches Gemma 4 E4B to produce
-    BIP-like text given an element and a real anchor BIP as topical
-    grounding. No score is included at this stage -- score
-    conditioning is introduced during PPO training.
+    Builds the SFT training prompt. reference_text is a real BIP shown
+    as a topical/stylistic reference. The training target is a
+    DIFFERENT real BIP for the same element -- never the reference
+    itself. This prevents the model from learning to copy its input,
+    which is the failure mode of using the same text as both
+    reference and target.
     """
     return f"""You are a school principal writing a Building Improvement Plan.
 
@@ -29,64 +32,113 @@ Element: {element}
 Guidance: {rubric_text}
 
 Reference example on a similar topic:
-{anchor_text}
+{reference_text}
 
 Write your own BIP response for this element, addressing a similar
 theme but in your own words:
 """
 
 
+def build_sft_pairs(anchor_df, rng: np.random.Generator | None = None) -> list[dict]:
+    """
+    For each element, pairs every real BIP with a DIFFERENT real BIP
+    from the same element to serve as the training target. This is
+    the core fix: the reference shown in the prompt and the
+    completion the model is trained to produce must never be
+    identical text, or the model learns to copy verbatim.
+    """
+    rng = rng or np.random.default_rng(42)
+    pairs = []
+
+    for element, group in anchor_df.groupby("Element_numberX"):
+        texts = group["Text"].tolist()
+        if len(texts) < 2:
+            continue
+        idxs = list(range(len(texts)))
+        for i in idxs:
+            others = [j for j in idxs if j != i]
+            j = rng.choice(others)
+            pairs.append({
+                "element": element,
+                "reference_text": texts[i],
+                "target_text": texts[j],
+            })
+    return pairs
+
+
 def build_sft_dataset(
     anchor_df,
     tokenizer,
     max_length: int = 1024,
+    rng: np.random.Generator | None = None,
 ) -> Dataset:
     """
-    Builds the SFT training dataset from the anchor pool.
-    Input: prompt (element + rubric + anchor)
-    Output: the anchor BIP text itself, used as the target completion.
-
-    This trains Gemma 4 E4B to complete BIP-like text given the prompt
-    structure it will see during PPO, without ever using scores.
+    Builds the SFT training dataset. Prompt tokens are masked with
+    -100 so the loss is computed only on the completion, not on the
+    rubric guidance or reference text the model is shown.
     """
     from src.rewards.rubric_reward import RubricReward
 
-    prompts = []
-    completions = []
+    pairs = build_sft_pairs(anchor_df, rng=rng)
 
-    for _, row in anchor_df.iterrows():
-        element = row["Element_numberX"]
-        anchor_text = row["Text"]
-
-        # use score-4 rubric text as generic guidance during warmup
-        # since no score conditioning happens at this stage
+    prompts, completions, elements = [], [], []
+    for pair in pairs:
+        element = pair["element"]
+        # generic score-4 guidance during warmup -- no score
+        # conditioning happens until PPO
         rubric_text = RubricReward.RUBRIC[element][4]
-
-        prompt = build_sft_prompt(element, rubric_text, anchor_text)
+        prompt = build_sft_prompt(element, rubric_text, pair["reference_text"])
         prompts.append(prompt)
-        completions.append(anchor_text)
+        completions.append(pair["target_text"])
+        elements.append(element)
 
-    full_texts = [p + c for p, c in zip(prompts, completions)]
-
-    hf_dataset = Dataset.from_dict({"text": full_texts})
+    hf_dataset = Dataset.from_dict({
+        "prompt": prompts,
+        "completion": completions,
+    })
 
     def tokenize(batch):
-        tokenized = tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-        )
-        tokenized["labels"] = [
-            [-100 if t == tokenizer.pad_token_id else t for t in ids]
-            for ids in tokenized["input_ids"]
-        ]
-        return tokenized
+        input_ids_batch, labels_batch, attn_batch = [], [], []
+
+        for prompt, completion in zip(batch["prompt"], batch["completion"]):
+            prompt_ids = tokenizer(
+                prompt, add_special_tokens=True, truncation=True,
+                max_length=max_length,
+            )["input_ids"]
+
+            full_ids = tokenizer(
+                prompt + completion, add_special_tokens=True,
+                truncation=True, max_length=max_length,
+            )["input_ids"]
+
+            # prompt_len is how many leading tokens to mask.
+            # Approximate boundary via the prompt-only tokenization --
+            # standard practice for causal LM completion masking
+            # without a chat template.
+            prompt_len = min(len(prompt_ids), len(full_ids))
+
+            pad_len = max_length - len(full_ids)
+            input_ids = full_ids + [tokenizer.pad_token_id] * pad_len
+            attention_mask = [1] * len(full_ids) + [0] * pad_len
+
+            labels = [-100] * prompt_len + full_ids[prompt_len:]
+            labels = labels[:max_length]
+            labels = labels + [-100] * (max_length - len(labels))
+
+            input_ids_batch.append(input_ids)
+            labels_batch.append(labels)
+            attn_batch.append(attention_mask)
+
+        return {
+            "input_ids": input_ids_batch,
+            "labels": labels_batch,
+            "attention_mask": attn_batch,
+        }
 
     return hf_dataset.map(
         tokenize,
         batched=True,
-        remove_columns=["text"],
+        remove_columns=["prompt", "completion"],
         load_from_cache_file=False,
     )
 
@@ -102,9 +154,6 @@ def setup_generator_model_and_tokenizer(config: GeneratorSFTConfig):
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"Loading model: {config.model_name}")
-    # Gemma4ForConditionalGeneration explicitly loads the full
-    # multimodal architecture. Vision/audio towers remain present
-    # but idle during text-only generation.
     model = Gemma4ForConditionalGeneration.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
@@ -115,7 +164,7 @@ def setup_generator_model_and_tokenizer(config: GeneratorSFTConfig):
         task_type=TaskType.CAUSAL_LM,
         r=config.lora.r,
         lora_alpha=config.lora.lora_alpha,
-        target_modules=config.lora.target_modules,  # regex string
+        target_modules=config.lora.target_modules,
         bias=config.lora.bias,
         lora_dropout=config.lora.lora_dropout,
     )
@@ -158,6 +207,10 @@ def train(config: GeneratorSFTConfig, dataset: Dataset, tokenizer=None) -> None:
         remove_unused_columns=False,
     )
 
+    # default_data_collator works fine here since every example is
+    # already padded to max_length with correctly masked labels
+    from transformers import default_data_collator
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -180,7 +233,6 @@ if __name__ == "__main__":
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-    from transformers import Trainer
     from src.data.corpus import load, for_anchor_pool
 
     parser = argparse.ArgumentParser(description="Train GeneratorSFT")
@@ -204,14 +256,16 @@ if __name__ == "__main__":
     anchor_df = for_anchor_pool(df)
     print(f"Anchor pool size: {len(anchor_df):,}")
 
-    print("Tokenizing SFT dataset...")
+    print("Tokenizing SFT dataset with distinct reference/target pairs...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    rng = np.random.default_rng(config.seed)
     dataset = build_sft_dataset(
         anchor_df, tokenizer,
         max_length=512 if args.smoke_test else config.max_seq_length,
+        rng=rng,
     )
 
     if args.smoke_test:

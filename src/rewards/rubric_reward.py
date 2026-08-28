@@ -10,15 +10,17 @@ class RubricReward:
     Computes a rubric alignment reward for candidate synthetic BIPs
     using Gemma 4 E4B as a frozen few-shot rubric judge.
 
-    The model receives the NEE rubric criteria for the target element
-    and score level, plus a few gold standard examples, and predicts
-    whether the candidate BIP warrants the target score.
+    The judge is BLIND to the target score -- it is shown all three
+    rubric levels and asked to independently determine which one the
+    candidate earns. The target score is only used afterward, outside
+    the model, to compute the reward. This matters because revealing
+    the target and asking "does this earn a {target}?" biases an
+    instruction-tuned model toward agreement regardless of actual
+    quality.
 
     This model is always frozen -- it is never updated during PPO.
     """
 
-    # rubric criteria text for each element and score level
-    # sourced directly from rubric.tsv
     RUBRIC = {
         "Element1": {
             0: "The principal describes little or no leadership involvement in BIP development.",
@@ -57,24 +59,27 @@ class RubricReward:
         },
     }
 
-    SCORE_LABELS = {0: "0", 2: "2", 4: "4"}
-
     def __init__(
         self,
         model_name: str = "google/gemma-4-E4B-it",
         device: str = "cuda",
         few_shot_examples: dict | None = None,
     ):
+        """
+        few_shot_examples: dict keyed by (element, score) -> list[str]
+        of real BIP texts known to earn that score. Populate this
+        using build_few_shot_examples() on the gold standard set
+        before instantiating, e.g.:
+
+            gold_df = load_gold_standard(...)
+            fs = RubricReward.build_few_shot_examples(gold_df)
+            judge = RubricReward(few_shot_examples=fs)
+        """
         self.device = device
         self.few_shot_examples = few_shot_examples or {}
 
         print(f"Loading Gemma 4 rubric reward model: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-        # Gemma 4 is multimodal by architecture even for text-only use.
-        # Use the explicit conditional generation class rather than
-        # AutoModelForCausalLM -- the vision/audio towers stay idle
-        # during text-only inference but must be loaded via this class.
         self.model = Gemma4ForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -87,33 +92,59 @@ class RubricReward:
 
         print("RubricReward ready.")
 
-    def _build_prompt(
-        self,
-        element: str,
-        target_score: int,
-        candidate: str,
-    ) -> str:
+    @classmethod
+    def build_few_shot_examples(
+        cls,
+        gold_df,
+        text_col: str = "Text",
+        element_col: str = "Element_numberX",
+        score_col: str = "score",
+        max_examples: int = 3,
+    ) -> dict:
         """
-        Builds the few-shot prompt for the rubric judge.
+        Builds the few_shot_examples dict from the 23 gold standard
+        BIPs, grouped by (element, score). Used only as frozen
+        in-context demonstrations -- never as training data. The
+        gold standard set remains held out for final evaluation.
         """
-        rubric_criteria = self.RUBRIC[element][target_score]
-        examples = self.few_shot_examples.get((element, target_score), [])
+        examples = {}
+        for (element, score), group in gold_df.groupby([element_col, score_col]):
+            examples[(element, int(score))] = group[text_col].tolist()[:max_examples]
+        return examples
+
+    def _build_prompt(self, element: str, candidate: str) -> str:
+        """
+        Builds a BLIND scoring prompt. All three rubric levels are
+        shown; the model must independently pick one. The target
+        score is never mentioned here.
+        """
+        criteria_block = "\n".join(
+            f"Score {score}: {text}"
+            for score, text in sorted(self.RUBRIC[element].items())
+        )
 
         prompt = f"""You are an expert evaluator of school principal Building Improvement Plans (BIPs).
 
-You will score a BIP response for {element} according to the NEE rubric.
+You will independently score a BIP response for {element} according to the NEE rubric below. Do not assume any particular score -- judge based only on the content of the response.
 
-Rubric criteria for score {target_score}:
-{rubric_criteria}
+Rubric criteria for {element}:
+{criteria_block}
 
 """
-        if examples:
-            prompt += "Examples of BIPs that earn this score:\n\n"
-            for i, ex in enumerate(examples[:3], 1):
-                prompt += f"Example {i}:\n{ex}\n\n"
+        # attach few-shot examples across all three score levels if available,
+        # so the judge sees calibration anchors without knowing which
+        # level the candidate should hit
+        any_examples = False
+        for score in (0, 2, 4):
+            examples = self.few_shot_examples.get((element, score), [])
+            if examples:
+                if not any_examples:
+                    prompt += "Reference examples at each score level:\n\n"
+                    any_examples = True
+                prompt += f"Example earning score {score}:\n{examples[0]}\n\n"
 
-        prompt += f"""Now score the following BIP response for {element}.
-The target score is {target_score}. Does this BIP warrant a score of {target_score}?
+        prompt += f"""Now read the following BIP response and determine which
+score (0, 2, or 4) it earns.
 
 BIP response:
 {candidate}
@@ -124,32 +155,21 @@ Score:"""
         return prompt
 
     @torch.no_grad()
-    def score(
-        self,
-        candidates: list[str],
-        elements: list[str],
-        target_scores: list[int],
-    ) -> list[float]:
+    def predict(self, candidates: list[str], elements: list[str]) -> list[int | None]:
         """
-        Scores a list of candidate BIPs for rubric alignment.
-
-        Returns a reward in [0, 1] for each candidate:
-            1.0  -- predicted score matches target score exactly
-            0.5  -- predicted score is adjacent (one level away)
-            0.0  -- predicted score is far off
+        Returns the judge's independently predicted score for each
+        candidate, with no knowledge of any intended target score.
         """
-        rewards = []
+        predictions = []
 
-        for candidate, element, target_score in zip(
-            candidates, elements, target_scores
-        ):
-            prompt = self._build_prompt(element, target_score, candidate)
+        for candidate, element in zip(candidates, elements):
+            prompt = self._build_prompt(element, candidate)
 
             inputs = self.tokenizer(
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=1024,
+                max_length=1536,
             ).to(self.device)
 
             outputs = self.model.generate(
@@ -164,31 +184,39 @@ Score:"""
                 skip_special_tokens=True,
             ).strip()
 
-            predicted_score = self._parse_score(generated)
-            reward = self._compute_reward(predicted_score, target_score)
-            rewards.append(reward)
+            predictions.append(self._parse_score(generated))
 
-        return rewards
+        return predictions
+
+    def score(
+        self,
+        candidates: list[str],
+        elements: list[str],
+        target_scores: list[int],
+    ) -> list[float]:
+        """
+        Scores a list of candidate BIPs for rubric alignment. The
+        judge predicts blind (see predict()); reward is computed
+        afterward by comparing the blind prediction to target_scores.
+
+            1.0  -- predicted score matches target score exactly
+            0.5  -- predicted score is adjacent (one rubric step away)
+            0.0  -- predicted score is far off or unparseable
+        """
+        predicted_scores = self.predict(candidates, elements)
+        return [
+            self._compute_reward(pred, target)
+            for pred, target in zip(predicted_scores, target_scores)
+        ]
 
     def _parse_score(self, generated: str) -> int | None:
-        """
-        Extracts a score (0, 2, or 4) from the model's generated text.
-        Returns None if no valid score found.
-        """
         for token in generated.split():
             cleaned = token.strip(".,;:")
             if cleaned in ("0", "2", "4"):
                 return int(cleaned)
         return None
 
-    def _compute_reward(
-        self,
-        predicted: int | None,
-        target: int,
-    ) -> float:
-        """
-        Converts predicted vs target score into a reward value.
-        """
+    def _compute_reward(self, predicted: int | None, target: int) -> float:
         if predicted is None:
             return 0.0
         if predicted == target:
@@ -202,10 +230,7 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-    judge = RubricReward(
-        model_name="google/gemma-4-E4B-it",
-        device="cuda",
-    )
+    judge = RubricReward(model_name="google/gemma-4-E4B-it", device="cuda")
 
     candidates = [
         "Throughout the school year, we monitored our building "
@@ -228,10 +253,11 @@ if __name__ == "__main__":
     elements = ["Element6", "Element6", "Element3"]
     target_scores = [4, 4, 4]
 
-    print("Testing rubric alignment scoring:")
+    print("Testing BLIND rubric alignment scoring:")
+    predicted = judge.predict(candidates, elements)
     rewards = judge.score(candidates, elements, target_scores)
-    for cand, elem, target, reward in zip(
-        candidates, elements, target_scores, rewards
+    for cand, elem, target, pred, reward in zip(
+        candidates, elements, target_scores, predicted, rewards
     ):
-        print(f"  {elem} | target={target} | reward={reward:.1f} | "
-              f"{cand[:60]}...")
+        print(f"  {elem} | predicted={pred} target={target} "
+              f"reward={reward:.1f} | {cand[:50]}...")

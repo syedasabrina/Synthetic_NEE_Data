@@ -5,18 +5,26 @@ import numpy as np
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
-import sys
-
 
 
 class AuthenticityReward:
     """
     Computes an authenticity reward for candidate synthetic BIPs
-    using BIPDomainSFT perplexity as the signal.
+    using BIPDomainSFT perplexity as the signal, combined with a
+    repetition penalty.
 
-    Lower perplexity under BIPDomainSFT means the candidate looks
-    more like real principal writing. The reward is the negative
-    normalized mean per-token log-likelihood, scaled to [0, 1].
+    Raw perplexity alone is gameable: the lowest-perplexity text under
+    a domain LM is often repetitive boilerplate, not genuinely varied
+    authentic writing. PPO will find this shortcut if it is not
+    guarded against. Two mitigations are applied:
+
+    1. Batch-relative normalization -- reward reflects how authentic
+       a candidate is RELATIVE to others in the same batch, rather
+       than an absolute exp(-nll) value that clusters near a fixed
+       point for any coherent English text.
+    2. Repetition penalty -- a distinct-bigram ratio multiplies the
+       perplexity-based reward, so repetitive low-perplexity text is
+       penalized rather than rewarded.
 
     This model is always frozen -- it is never updated during PPO.
     """
@@ -29,7 +37,7 @@ class AuthenticityReward:
     ):
         self.device = device
 
-        print(f"Loading BIPDomainSFT authenticity reward model...")
+        print("Loading BIPDomainSFT authenticity reward model...")
         self.tokenizer = AutoTokenizer.from_pretrained(adapter_path)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -42,52 +50,34 @@ class AuthenticityReward:
         self.model = PeftModel.from_pretrained(base, adapter_path)
         self.model.eval()
 
-        # freeze all parameters -- this model never trains
         for param in self.model.parameters():
             param.requires_grad = False
 
         print("AuthenticityReward ready.")
 
-    @torch.no_grad()
-    def score(self, texts: list[str]) -> list[float]:
+    def _repetition_score(self, text: str) -> float:
         """
-        Given a list of candidate BIP texts, returns a reward score
-        in [0, 1] for each. Higher score = more authentic.
-
-        Uses mean per-token negative log-likelihood (NLL) as the
-        perplexity proxy. Lower NLL = higher reward.
+        Distinct-bigram ratio in [0, 1]. Higher means less repetitive.
+        A candidate that repeats the same phrase gets a low score
+        here, which multiplies down its final reward regardless of
+        how low its perplexity is.
         """
-        nlls = []
-
-        for text in texts:
-            inputs = self.tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-                padding=False,
-            ).to(self.device)
-
-            # labels = input_ids so loss = per-token NLL
-            outputs = self.model(
-                **inputs,
-                labels=inputs["input_ids"],
-            )
-            # outputs.loss is mean NLL across tokens
-            nlls.append(outputs.loss.item())
-
-        # convert NLL to reward: lower NLL = higher reward
-        # use exp(-nll) to map to (0, 1] range
-        rewards = [float(np.exp(-nll)) for nll in nlls]
-        return rewards
+        tokens = text.split()
+        if len(tokens) < 2:
+            return 0.5  # too short to judge; neutral score
+        bigrams = list(zip(tokens, tokens[1:]))
+        if len(bigrams) == 0:
+            return 0.5
+        return len(set(bigrams)) / len(bigrams)
 
     @torch.no_grad()
-    def score_batch(self, texts: list[str], batch_size: int = 8) -> list[float]:
+    def _compute_nlls(self, texts: list[str], batch_size: int = 8) -> np.ndarray:
         """
-        Batched version of score() for efficiency during PPO training.
-        Pads within each batch for fast GPU throughput.
+        Computes per-example mean NLL for a list of texts, batched
+        for GPU throughput. Returns a numpy array of raw NLL values
+        (not yet converted to reward).
         """
-        all_rewards = []
+        all_nlls = []
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i: i + batch_size]
@@ -100,8 +90,6 @@ class AuthenticityReward:
                 padding=True,
             ).to(self.device)
 
-            # compute per-example NLL manually when batching
-            # because HF loss averages across the whole batch
             labels = inputs["input_ids"].clone()
             labels[labels == self.tokenizer.pad_token_id] = -100
 
@@ -111,7 +99,6 @@ class AuthenticityReward:
                 labels=labels,
             )
 
-            # get per-token logits and compute per-example NLL
             logits = outputs.logits
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -125,47 +112,54 @@ class AuthenticityReward:
                 shift_labels.view(-1),
             ).view(shift_labels.size())
 
-            # mean NLL per example (ignoring padding)
             mask = (shift_labels != -100).float()
             example_nlls = (token_losses * mask).sum(dim=1) / mask.sum(dim=1)
-            rewards = [float(np.exp(-nll.item())) for nll in example_nlls]
-            all_rewards.extend(rewards)
+            all_nlls.extend(example_nlls.float().cpu().numpy().tolist())
 
-        return all_rewards
-    
+        return np.array(all_nlls)
 
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    @torch.no_grad()
+    def score_batch(
+        self,
+        texts: list[str],
+        batch_size: int = 8,
+        normalize: bool = True,
+    ) -> list[float]:
+        """
+        Returns an authenticity reward in roughly [0, 1] for each
+        candidate, combining batch-normalized perplexity with a
+        repetition penalty.
 
-    reward_model = AuthenticityReward(
-        base_model_name="Qwen/Qwen2.5-7B",
-        adapter_path="models/BIPDomainSFT",
-        device="cpu",  # use cpu for testing on normal node
-    )
+        normalize=True (default, used during PPO): reward reflects
+        relative standing within the batch via z-score + sigmoid.
+        This avoids the compressed, uninformative signal that raw
+        exp(-nll) produces when most candidates cluster near the
+        same perplexity.
 
-    # test with a real BIP-like text vs generic text
-    test_texts = [
-        "Element6: Throughout the school year, we monitored our "
-        "building improvement objectives by collecting MAP data "
-        "every eight weeks and reviewing results with our grade "
-        "level teams during collaborative planning time.",
+        normalize=False: raw exp(-nll) per example, useful for
+        one-off diagnostic scoring outside a batch context (e.g. the
+        test script comparing a handful of hand-written examples).
+        """
+        nlls = self._compute_nlls(texts, batch_size=batch_size)
 
-        "The weather today is sunny with a high of 75 degrees. "
-        "We recommend bringing sunscreen if you plan to be outside "
-        "for extended periods of time.",
+        if normalize and len(nlls) > 1:
+            mean, std = nlls.mean(), nlls.std() + 1e-6
+            z = (nlls - mean) / std
+            # lower NLL should give higher reward, so invert sign
+            base_reward = 1.0 / (1.0 + np.exp(z))  # sigmoid(-z)
+        else:
+            base_reward = np.exp(-nlls)
 
-        "Element3: Our objectives are aligned to the district CSIP "
-        "goals around literacy and mathematics proficiency. We "
-        "established SMART goals for each building objective with "
-        "measurable baseline data from last year's assessments.",
-    ]
+        rep_scores = np.array([self._repetition_score(t) for t in texts])
+        combined = base_reward * rep_scores
 
-    print("Testing individual scoring:")
-    rewards = reward_model.score(test_texts)
-    for text, reward in zip(test_texts, rewards):
-        print(f"  reward={reward:.4f} | {text[:60]}...")
+        return combined.tolist()
 
-    print("\nTesting batch scoring:")
-    batch_rewards = reward_model.score_batch(test_texts, batch_size=2)
-    for text, reward in zip(test_texts, batch_rewards):
-        print(f"  reward={reward:.4f} | {text[:60]}...")
+    @torch.no_grad()
+    def score(self, texts: list[str]) -> list[float]:
+        """
+        Simple non-batched scoring for quick manual testing. Uses
+        raw exp(-nll) x repetition penalty, no batch normalization,
+        since a single-example call has no batch to normalize against.
+        """
+        return self.score_batch(texts, batch_size=1, normalize=False)

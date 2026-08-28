@@ -8,10 +8,13 @@ import torch
 import numpy as np
 from datasets import Dataset
 from peft import LoraConfig, TaskType
-from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
 
-from trl.experimental.ppo import PPOTrainer, AutoModelForCausalLMWithValueHead
-from trl import PPOConfig as TRLPPOConfig
+from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
+from trl.experimental.ppo import (
+    PPOTrainer,
+    AutoModelForCausalLMWithValueHead,
+    PPOConfig as TRLPPOConfig,
+)
 
 from src.utils.config import PPOConfig
 from src.rewards.authenticity_reward import AuthenticityReward
@@ -21,10 +24,10 @@ from src.rewards.combined_reward import CombinedReward
 
 def build_ppo_prompt(element: str, target_score: int, rubric_text: str, anchor_text: str) -> str:
     """
-    Builds the PPO training prompt. Unlike the SFT warmup, this
-    includes the target score explicitly -- this is where score
-    conditioning is introduced, reinforced entirely through the
-    reward signal rather than through supervised labels.
+    PPO prompt. Unlike the SFT warmup, this includes the target score
+    explicitly -- score conditioning is introduced here and reinforced
+    entirely through the reward signal, never through supervised
+    labels on noisy real scores.
     """
     return f"""You are a school principal writing a Building Improvement Plan.
 
@@ -41,40 +44,78 @@ own words, addressing a similar theme to the reference:
 """
 
 
+class ElementCycler:
+    """
+    Cycles through all seven elements in shuffled order, reshuffling
+    once exhausted. Used so each PPO batch draws from a genuinely
+    varied mix of elements rather than drifting toward whichever
+    element happens to be sampled most by chance -- important given
+    the anchor pool's uneven per-element, per-score counts (e.g. only
+    ~2 score-0 anchors exist for Element1 vs 11 for Element6).
+    """
+
+    def __init__(self, elements: list[str], rng: np.random.Generator):
+        self.elements = list(elements)
+        self.rng = rng
+        self._shuffle()
+        self.idx = 0
+
+    def _shuffle(self):
+        self.rng.shuffle(self.elements)
+
+    def next(self) -> str:
+        if self.idx >= len(self.elements):
+            self._shuffle()
+            self.idx = 0
+        e = self.elements[self.idx]
+        self.idx += 1
+        return e
+
+
 def sample_ppo_batch(
     anchor_df,
     rubric_class,
+    element_cycler: ElementCycler,
     batch_size: int,
     score_weights: dict[int, float] | None = None,
     rng: np.random.Generator | None = None,
 ) -> list[dict]:
     """
     Samples a batch of (element, target_score, anchor) tuples for one
-    PPO step. score_weights controls how often each score level is
-    sampled -- default oversamples 2 and 4 since 0 anchors are scarce.
+    PPO step. Elements are drawn via ElementCycler for even coverage;
+    scores are drawn by weight, oversampling 2 and 4 since score-0
+    anchors are scarce across every element.
     """
     rng = rng or np.random.default_rng()
     score_weights = score_weights or {0: 0.1, 2: 0.35, 4: 0.55}
-
     scores = list(score_weights.keys())
     weights = list(score_weights.values())
 
     batch = []
     for _ in range(batch_size):
-        target_score = rng.choice(scores, p=weights)
-        # filter anchor pool to rows that have this score, any element
-        pool = anchor_df[anchor_df["score"] == target_score]
+        element = element_cycler.next()
+        target_score = int(rng.choice(scores, p=weights))
+
+        pool = anchor_df[
+            (anchor_df["Element_numberX"] == element)
+            & (anchor_df["score"] == target_score)
+        ]
         if len(pool) == 0:
-            # fallback: use score 4 anchors if the sampled score has none
+            # fall back to score 4 for this element, then to any
+            # score 4 anchor if this element has none at all
+            pool = anchor_df[
+                (anchor_df["Element_numberX"] == element)
+                & (anchor_df["score"] == 4)
+            ]
+        if len(pool) == 0:
             pool = anchor_df[anchor_df["score"] == 4]
+
         row = pool.sample(1, random_state=int(rng.integers(0, 1_000_000))).iloc[0]
-        element = row["Element_numberX"]
-        anchor_text = row["Text"]
         rubric_text = rubric_class.RUBRIC[element][target_score]
         batch.append({
             "element": element,
-            "target_score": int(target_score),
-            "anchor_text": anchor_text,
+            "target_score": target_score,
+            "anchor_text": row["Text"],
             "rubric_text": rubric_text,
         })
     return batch
@@ -83,16 +124,11 @@ def sample_ppo_batch(
 class PPOPipeline:
     """
     Wraps TRL's PPOTrainer with the dual reward model setup described
-    in the project scope. Handles prompt construction, reward
-    computation, and diagnostic logging every step.
+    in the project scope. Handles element-stratified prompt
+    construction, reward computation, and per-step diagnostic logging.
     """
 
-    def __init__(
-        self,
-        config: PPOConfig,
-        anchor_df,
-        device: str = "cuda",
-    ):
+    def __init__(self, config: PPOConfig, anchor_df, device: str = "cuda"):
         self.config = config
         self.anchor_df = anchor_df
         self.device = device
@@ -102,7 +138,6 @@ class PPOPipeline:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # base model with value head required by PPOTrainer
         base_model = Gemma4ForConditionalGeneration.from_pretrained(
             config.model_name,
             torch_dtype=torch.bfloat16,
@@ -123,8 +158,8 @@ class PPOPipeline:
             peft_config=lora_config,
         )
 
-        # load the SFT-trained LoRA weights as the starting point
-        # this is critical -- PPO on a cold model is unstable
+        # load the SFT-trained LoRA weights as the starting point --
+        # PPO on a cold model is unstable
         self.model.pretrained_model.load_adapter(
             config.sft_checkpoint, adapter_name="default"
         )
@@ -156,16 +191,14 @@ class PPOPipeline:
         )
 
         self.rng = np.random.default_rng(config.seed)
+        self.element_cycler = ElementCycler(
+            anchor_df["Element_numberX"].unique().tolist(), self.rng
+        )
+
         os.makedirs(config.output_dir, exist_ok=True)
         os.makedirs(config.log_dir, exist_ok=True)
 
     def run(self, max_steps: int | None = None):
-        """
-        Main PPO training loop. Logs combined reward, authenticity
-        reward, rubric reward, and KL divergence every step so
-        instability is visible immediately rather than discovered
-        after a long run completes.
-        """
         max_steps = max_steps or self.config.max_steps
         diagnostics = []
 
@@ -173,6 +206,7 @@ class PPOPipeline:
             batch = sample_ppo_batch(
                 self.anchor_df,
                 self.rubric_reward,
+                self.element_cycler,
                 batch_size=self.config.batch_size,
                 rng=self.rng,
             )
@@ -214,11 +248,10 @@ class PPOPipeline:
 
             stats = self.trainer.step(query_tensors, response_tensors, rewards)
 
-            # log diagnostics every step -- cheap and catches
-            # instability early rather than after hours of wasted compute
             mean_auth = float(np.mean([o.authenticity for o in reward_outputs]))
             mean_rubric = float(np.mean([o.rubric for o in reward_outputs]))
             mean_combined = float(np.mean([o.combined for o in reward_outputs]))
+            element_counts = {e: elements.count(e) for e in set(elements)}
             kl = stats.get("objective/kl", None)
 
             diagnostics.append({
@@ -227,12 +260,13 @@ class PPOPipeline:
                 "mean_rubric": mean_rubric,
                 "mean_combined": mean_combined,
                 "kl": kl,
+                "element_counts": element_counts,
             })
 
             if step % 10 == 0:
                 print(f"step={step} auth={mean_auth:.4f} "
                       f"rubric={mean_rubric:.4f} combined={mean_combined:.4f} "
-                      f"kl={kl}")
+                      f"kl={kl} elements={element_counts}")
 
             if step % self.config.save_every == 0 and step > 0:
                 ckpt_dir = f"{self.config.output_dir}/checkpoint-{step}"
