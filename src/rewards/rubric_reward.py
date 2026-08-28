@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import torch
 from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
 
 
 class RubricReward:
     """
     Computes a rubric alignment reward for candidate synthetic BIPs
-    using Gemma-2-2B as a frozen few-shot rubric judge.
+    using Gemma 4 E4B as a frozen few-shot rubric judge.
 
     The model receives the NEE rubric criteria for the target element
     and score level, plus a few gold standard examples, and predicts
@@ -61,16 +61,21 @@ class RubricReward:
 
     def __init__(
         self,
-        model_name: str = "google/gemma-2-2b-it",
+        model_name: str = "google/gemma-4-E4B-it",
         device: str = "cuda",
         few_shot_examples: dict | None = None,
     ):
         self.device = device
         self.few_shot_examples = few_shot_examples or {}
 
-        print(f"Loading Gemma rubric reward model: {model_name}")
+        print(f"Loading Gemma 4 rubric reward model: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
+
+        # Gemma 4 is multimodal by architecture even for text-only use.
+        # Use the explicit conditional generation class rather than
+        # AutoModelForCausalLM -- the vision/audio towers stay idle
+        # during text-only inference but must be loaded via this class.
+        self.model = Gemma4ForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             device_map=device,
@@ -154,13 +159,11 @@ Score:"""
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-            # decode only the generated tokens, not the prompt
             generated = self.tokenizer.decode(
                 outputs[0][inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True,
             ).strip()
 
-            # extract predicted score from generated text
             predicted_score = self._parse_score(generated)
             reward = self._compute_reward(predicted_score, target_score)
             rewards.append(reward)
@@ -190,10 +193,8 @@ Score:"""
             return 0.0
         if predicted == target:
             return 1.0
-        # adjacent scores in the rubric: 0 <-> 2 <-> 4
         if abs(predicted - target) == 2:
             return 0.5
-        # far off: 0 vs 4
         return 0.0
 
 
@@ -202,12 +203,11 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
     judge = RubricReward(
-        model_name="google/gemma-2-2b-it",
+        model_name="google/gemma-4-E4B-it",
         device="cuda",
     )
 
     candidates = [
-        # should score high for Element6 at score 4
         "Throughout the school year, we monitored our building "
         "improvement objectives by collecting MAP data every eight "
         "weeks and reviewing results with our grade level teams. "
@@ -215,10 +215,8 @@ if __name__ == "__main__":
         "in reading fluency, we implemented small group intervention "
         "blocks three times per week and adjusted our pacing guide.",
 
-        # should score low for Element6 at score 4
         "We monitored our goals.",
 
-        # should score high for Element3 at score 4
         "Our BIP objectives are directly aligned to the district "
         "CSIP goals for 2023-2024. Objective 1 supports CSIP Goal 2 "
         "around increasing ELA proficiency. Objective 2 supports "

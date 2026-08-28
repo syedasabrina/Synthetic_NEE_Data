@@ -52,10 +52,10 @@ for cand, reward in zip(candidates, auth_rewards):
 
 print()
 print("=" * 60)
-print("RUBRIC REWARD (Gemma-2-2B few-shot judge)")
+print("RUBRIC REWARD (Gemma-4-E4B-it few-shot judge)")
 print("=" * 60)
 rubric = RubricReward(
-    model_name="google/gemma-2-2b-it",
+    model_name="google/gemma-4-E4B-it",
     device="cuda",
 )
 rubric_rewards = rubric.score(candidates, elements, target_scores)

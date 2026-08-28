@@ -45,48 +45,22 @@ class AnchorSamplerConfig:
     seed: int = 42
 
 
-# ── Generation ───────────────────────────────────────────────────────
-
-@dataclass
-class GenerationConfig:
-    model_name: str = "gemini-2.0-flash"
-    rubric_path: str = "docs/rubric.tsv"
-    bip_form_path: str = "docs/2021_2022BIPProcessOrganizer.pdf"
-    target_accepted_per_element_score: dict = field(
-        default_factory=lambda: {0: 30, 2: 200, 4: 500}
-    )
-    temperature: float = 0.7
-    # target length range from EDA: p50=150, p90=469 tokens
-    # length correlates with score in real data -- control for this in prompt
-    target_min_tokens: int = 150
-    target_max_tokens: int = 469
-    max_api_tokens: int = 1024
-    max_retries: int = 5
-    anchor_similarity_threshold: float = 0.85
-    output_dir: str = "data/synthetic/candidates"
-    accepted_dir: str = "data/synthetic/accepted"
-    rejected_dir: str = "data/synthetic/rejected"
-    log_dir: str = "logs/generation"
-    seed: int = 42
-
-
-# ── Judges ───────────────────────────────────────────────────────────
+# ── Judges / Reward Models ──────────────────────────────────────────
 
 @dataclass
 class AuthenticityJudgeConfig:
     model_name: str = "Qwen/Qwen2.5-7B"
-    model_path: str = ""            # filled after Module 1 training
+    model_path: str = "models/BIPDomainSFT"
     n_incontext_examples: int = 5
     log_dir: str = "logs/judges"
 
 
 @dataclass
 class RubricJudgeConfig:
-    model_name: str = "gemini-2.0-flash"
+    model_name: str = "google/gemma-4-E4B-it"
     rubric_path: str = "docs/rubric.tsv"
     # valid scores are 0, 2, 4
     # reject if judge score differs from intended score by more than one level
-    # one level means: 0 vs 2 is adjacent, 0 vs 4 is not
     max_score_deviation: int = 1
     log_dir: str = "logs/judges"
 
@@ -106,10 +80,36 @@ class JudgeConfig:
 
 @dataclass
 class LoRAConfig:
+    """
+    LoRA config for Qwen models (BIPDomainSFT, assessor).
+    Qwen's architecture has plain leaf-name Linear layers, so simple
+    exact-match target_modules works fine.
+    """
     r: int = 16
     lora_alpha: int = 32
     target_modules: list[str] = field(
         default_factory=lambda: ["q_proj", "v_proj"]
+    )
+    lora_dropout: float = 0.05
+    bias: str = "none"
+
+
+@dataclass
+class LoRAConfigGemma4:
+    """
+    LoRA config for Gemma 4 models (generator, rubric judge if ever
+    fine-tuned). Gemma 4 is multimodal by architecture -- its vision
+    and audio towers wrap attention projections in a custom Linear
+    subclass that also matches simple leaf names like "q_proj". Using
+    exact-match target_modules risks PEFT silently adapting the wrong
+    layers or aborting adapter injection. This regex restricts LoRA
+    to the text tower's plain nn.Linear projections only.
+    """
+    r: int = 16
+    lora_alpha: int = 32
+    target_modules: str = (
+        r".*language_model.layers.\d+."
+        r"(self_attn.(q|k|v|o)_proj|mlp.(gate|up|down)_proj)"
     )
     lora_dropout: float = 0.05
     bias: str = "none"
@@ -130,6 +130,48 @@ class BIPDomainSFTConfig:
     fp16: bool = False
     bf16: bool = True
     log_dir: str = "logs/BIPDomainSFT"
+    seed: int = 42
+
+
+@dataclass
+class GeneratorSFTConfig:
+    """
+    Stage 4: SFT warmup for the Gemma 4 E4B generator before PPO.
+    No score conditioning at this stage -- see project scope.
+    """
+    model_name: str = "google/gemma-4-E4B-it"
+    output_dir: str = "models/GeneratorSFT"
+    num_train_epochs: int = 3
+    per_device_train_batch_size: int = 4
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 2e-4
+    warmup_ratio: float = 0.05
+    max_seq_length: int = 1024
+    lora: LoRAConfigGemma4 = field(default_factory=LoRAConfigGemma4)
+    bf16: bool = True
+    log_dir: str = "logs/GeneratorSFT"
+    seed: int = 42
+
+
+@dataclass
+class PPOConfig:
+    """
+    Stage 5: PPO training config for the generator.
+    alpha and beta are tuned via pilot runs before the full run.
+    """
+    model_name: str = "google/gemma-4-E4B-it"
+    sft_checkpoint: str = "models/GeneratorSFT"
+    output_dir: str = "models/PPOGenerator"
+    alpha: float = 0.5          # weight on authenticity reward
+    beta: float = 0.1           # weight on KL penalty
+    batch_size: int = 8
+    mini_batch_size: int = 2
+    ppo_epochs: int = 4
+    learning_rate: float = 1.41e-5
+    max_steps: int = 5000
+    save_every: int = 500
+    lora: LoRAConfigGemma4 = field(default_factory=LoRAConfigGemma4)
+    log_dir: str = "logs/PPO"
     seed: int = 42
 
 
@@ -198,9 +240,10 @@ class AuditConfig:
 class PipelineConfig:
     corpus: CorpusConfig = field(default_factory=CorpusConfig)
     anchor_sampler: AnchorSamplerConfig = field(default_factory=AnchorSamplerConfig)
-    generation: GenerationConfig = field(default_factory=GenerationConfig)
     judges: JudgeConfig = field(default_factory=JudgeConfig)
     bip_domain_sft: BIPDomainSFTConfig = field(default_factory=BIPDomainSFTConfig)
+    generator_sft: GeneratorSFTConfig = field(default_factory=GeneratorSFTConfig)
+    ppo: PPOConfig = field(default_factory=PPOConfig)
     assessor: AssessorConfig = field(default_factory=AssessorConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
