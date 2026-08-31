@@ -181,11 +181,19 @@ def train(config: GeneratorSFTConfig, dataset: Dataset, tokenizer=None) -> None:
     Saves the LoRA adapter checkpoint to config.output_dir.
     """
     os.makedirs(config.output_dir, exist_ok=True)
-    os.makedirs(config.log_dir, exist_ok=True)
 
     model, _tokenizer = setup_generator_model_and_tokenizer(config)
     if tokenizer is None:
         tokenizer = _tokenizer
+
+    # transformers 5.x removed warmup_ratio; compute steps explicitly
+    effective_batch = (
+        config.per_device_train_batch_size * config.gradient_accumulation_steps
+    )
+    steps_per_epoch = max(1, len(dataset) // effective_batch)
+    total_steps = steps_per_epoch * config.num_train_epochs
+    warmup_steps = int(total_steps * config.warmup_ratio)
+    print(f"Total steps: {total_steps}, warmup steps: {warmup_steps}")
 
     training_args = TrainingArguments(
         output_dir=config.output_dir,
@@ -193,15 +201,15 @@ def train(config: GeneratorSFTConfig, dataset: Dataset, tokenizer=None) -> None:
         per_device_train_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
-        warmup_ratio=config.warmup_ratio,
+        warmup_steps=warmup_steps,
         max_grad_norm=1.0,
-        bf16=config.bf16,
-        logging_dir=config.log_dir,
+        fp16=False,
+        bf16=True,
         logging_steps=50,
         save_strategy="epoch",
         save_total_limit=2,
         report_to="wandb",
-        run_name=f"GeneratorSFT-{config.model_name.split('/')[-1]}",
+        run_name=f"GeneratorSFT-{config.model_name.split('/')[-1]}",        
         seed=config.seed,
         dataloader_num_workers=2,
         remove_unused_columns=False,
