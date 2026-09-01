@@ -44,3 +44,4 @@ secrets.py
 scripts/train.slurm
 models/BIPDomainSFT/adapter_model.safetensors
 models/BIPDomainSFT/checkpoint-*
+scripts/train.slurm
