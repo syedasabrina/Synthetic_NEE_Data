@@ -1,284 +1,418 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 from pathlib import Path
 
-import torch
 import numpy as np
-from datasets import Dataset
-from peft import LoraConfig, TaskType
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
-from trl.experimental.ppo import (
-    PPOTrainer,
-    AutoModelForCausalLMWithValueHead,
-    PPOConfig as TRLPPOConfig,
-)
+from peft import PeftModel
 
-from src.utils.config import PPOConfig
 from src.rewards.authenticity_reward import AuthenticityReward
 from src.rewards.rubric_reward import RubricReward
-from src.rewards.combined_reward import CombinedReward
+from src.generation.sampler import (
+    ElementCycler,
+    build_generation_prompt,
+    sample_prompt_spec,
+)
 
 
-def build_ppo_prompt(element: str, target_score: int, rubric_text: str, anchor_text: str) -> str:
+class ValueHead(nn.Module):
     """
-    PPO prompt. Unlike the SFT warmup, this includes the target score
-    explicitly -- score conditioning is introduced here and reinforced
-    entirely through the reward signal, never through supervised
-    labels on noisy real scores.
-    """
-    return f"""You are a school principal writing a Building Improvement Plan.
+    Scalar value estimate per token position, used as the PPO baseline.
 
-Element: {element}
-Target score: {target_score}
-Rubric criteria for this score: {rubric_text}
-
-Reference example on a similar topic:
-{anchor_text}
-
-Generate a BIP response for this element that earns a score of
-{target_score} according to the rubric criteria above. Write in your
-own words, addressing a similar theme to the reference:
-"""
-
-
-class ElementCycler:
-    """
-    Cycles through all seven elements in shuffled order, reshuffling
-    once exhausted. Used so each PPO batch draws from a genuinely
-    varied mix of elements rather than drifting toward whichever
-    element happens to be sampled most by chance -- important given
-    the anchor pool's uneven per-element, per-score counts (e.g. only
-    ~2 score-0 anchors exist for Element1 vs 11 for Element6).
+    Kept separate from the policy rather than sharing a trunk: the LoRA
+    adapter is the only trainable part of the policy, and coupling the
+    value function to it makes the two objectives fight over the same
+    small parameter budget.
     """
 
-    def __init__(self, elements: list[str], rng: np.random.Generator):
-        self.elements = list(elements)
-        self.rng = rng
-        self._shuffle()
-        self.idx = 0
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size // 4)
+        self.out = nn.Linear(hidden_size // 4, 1)
 
-    def _shuffle(self):
-        self.rng.shuffle(self.elements)
-
-    def next(self) -> str:
-        if self.idx >= len(self.elements):
-            self._shuffle()
-            self.idx = 0
-        e = self.elements[self.idx]
-        self.idx += 1
-        return e
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = torch.tanh(self.dense(hidden_states))
+        return self.out(x).squeeze(-1)
 
 
-def sample_ppo_batch(
-    anchor_df,
-    rubric_class,
-    element_cycler: ElementCycler,
-    batch_size: int,
-    score_weights: dict[int, float] | None = None,
-    rng: np.random.Generator | None = None,
-) -> list[dict]:
+class CustomPPO:
     """
-    Samples a batch of (element, target_score, anchor) tuples for one
-    PPO step. Elements are drawn via ElementCycler for even coverage;
-    scores are drawn by weight, oversampling 2 and 4 since score-0
-    anchors are scarce across every element.
-    """
-    rng = rng or np.random.default_rng()
-    score_weights = score_weights or {0: 0.1, 2: 0.35, 4: 0.55}
-    scores = list(score_weights.keys())
-    weights = list(score_weights.values())
+    PPO for a LoRA policy with a programmatic (non-neural) reward.
 
-    batch = []
-    for _ in range(batch_size):
-        element = element_cycler.next()
-        target_score = int(rng.choice(scores, p=weights))
+    TRL's PPOTrainer cannot be used here. Its get_reward() helper does:
 
-        pool = anchor_df[
-            (anchor_df["Element_numberX"] == element)
-            & (anchor_df["score"] == target_score)
-        ]
-        if len(pool) == 0:
-            # fall back to score 4 for this element, then to any
-            # score 4 anchor if this element has none at all
-            pool = anchor_df[
-                (anchor_df["Element_numberX"] == element)
-                & (anchor_df["score"] == 4)
-            ]
-        if len(pool) == 0:
-            pool = anchor_df[anchor_df["score"] == 4]
+        lm_backbone = getattr(model, model.base_model_prefix)
+        output = lm_backbone(input_ids=..., output_hidden_states=True)
+        reward_logits = model.score(output.hidden_states[-1])
 
-        row = pool.sample(1, random_state=int(rng.integers(0, 1_000_000))).iloc[0]
-        rubric_text = rubric_class.RUBRIC[element][target_score]
-        batch.append({
-            "element": element,
-            "target_score": target_score,
-            "anchor_text": row["Text"],
-            "rubric_text": rubric_text,
-        })
-    return batch
+    It hands the reward model token IDs and expects a transformer with
+    a .score head, doing the forward pass itself. Our reward decodes to
+    text, runs a 7B model twice with the adapter toggled, computes a
+    bigram ratio, then runs a separate 4B judge and parses a digit.
+    That is a Python function, not a scoring transformer, so the
+    interface does not fit and the rollout loop has to be ours.
 
-
-class PPOPipeline:
-    """
-    Wraps TRL's PPOTrainer with the dual reward model setup described
-    in the project scope. Handles element-stratified prompt
-    construction, reward computation, and per-step diagnostic logging.
+    Known risk: PPO fails silently when subtly wrong. The diagnostics
+    below check for the standard failure modes each step so a bad run
+    is visible within a few hundred steps rather than at the end.
     """
 
-    def __init__(self, config: PPOConfig, anchor_df, device: str = "cuda"):
-        self.config = config
-        self.anchor_df = anchor_df
+    def __init__(
+        self,
+        base_model_name: str = "google/gemma-4-E4B-it",
+        sft_checkpoint: str = "models/GeneratorSFT",
+        output_dir: str = "models/PPOGenerator",
+        anchor_df=None,
+        gold_df=None,
+        alpha: float = 0.5,
+        kl_coef: float = 0.1,
+        clip_range: float = 0.2,
+        vf_coef: float = 0.5,
+        gamma: float = 1.0,
+        lam: float = 0.95,
+        learning_rate: float = 1.41e-5,
+        batch_size: int = 4,
+        ppo_epochs: int = 2,
+        max_new_tokens: int = 320,
+        temperature: float = 0.9,
+        seed: int = 42,
+        device: str = "cuda",
+    ):
         self.device = device
+        self.output_dir = Path(output_dir)
+        self.alpha = alpha
+        self.kl_coef = kl_coef
+        self.clip_range = clip_range
+        self.vf_coef = vf_coef
+        self.gamma = gamma
+        self.lam = lam
+        self.batch_size = batch_size
+        self.ppo_epochs = ppo_epochs
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.anchor_df = anchor_df
 
-        print(f"Loading generator from SFT checkpoint: {config.sft_checkpoint}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.sft_checkpoint)
+        os.makedirs(self.output_dir, exist_ok=True)
+        torch.manual_seed(seed)
+        self.rng = np.random.default_rng(seed)
+
+        print(f"Loading policy: {base_model_name} + {sft_checkpoint}")
+        self.tokenizer = AutoTokenizer.from_pretrained(sft_checkpoint)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        base_model = Gemma4ForConditionalGeneration.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
+        base = Gemma4ForConditionalGeneration.from_pretrained(
+            base_model_name, dtype=torch.bfloat16, device_map=device,
+        )
+        self.policy = PeftModel.from_pretrained(
+            base, sft_checkpoint, is_trainable=True
         )
 
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=config.lora.r,
-            lora_alpha=config.lora.lora_alpha,
-            target_modules=config.lora.target_modules,
-            bias=config.lora.bias,
-            lora_dropout=config.lora.lora_dropout,
-        )
+        # the reference distribution for the KL penalty is the same
+        # model with the adapter disabled, so no second copy is needed
+        hidden = self.policy.config.text_config.hidden_size \
+            if hasattr(self.policy.config, "text_config") \
+            else self.policy.config.hidden_size
+        self.value_head = ValueHead(hidden).to(device).to(torch.bfloat16)
 
-        self.model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            base_model,
-            peft_config=lora_config,
+        trainable = [p for p in self.policy.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(
+            trainable + list(self.value_head.parameters()),
+            lr=learning_rate,
         )
-
-        # load the SFT-trained LoRA weights as the starting point --
-        # PPO on a cold model is unstable
-        self.model.pretrained_model.load_adapter(
-            config.sft_checkpoint, adapter_name="default"
-        )
-
-        trl_ppo_config = TRLPPOConfig(
-            model_name=config.model_name,
-            learning_rate=config.learning_rate,
-            batch_size=config.batch_size,
-            mini_batch_size=config.mini_batch_size,
-            ppo_epochs=config.ppo_epochs,
-            seed=config.seed,
-            log_with="wandb",
-        )
-
-        self.trainer = PPOTrainer(
-            config=trl_ppo_config,
-            model=self.model,
-            tokenizer=self.tokenizer,
-        )
+        n_train = sum(p.numel() for p in trainable)
+        print(f"Trainable policy params: {n_train:,}")
 
         print("Loading reward models...")
-        self.auth_reward = AuthenticityReward(device=device)
-        self.rubric_reward = RubricReward(device=device)
-        self.combined_reward = CombinedReward(
-            authenticity_reward=self.auth_reward,
-            rubric_reward=self.rubric_reward,
-            alpha=config.alpha,
-            beta=config.beta,
-        )
+        self.auth = AuthenticityReward(device=device)
+        few_shot = RubricReward.build_few_shot_examples(gold_df, max_examples=1)
+        self.rubric = RubricReward(device=device, few_shot_examples=few_shot)
 
-        self.rng = np.random.default_rng(config.seed)
         self.element_cycler = ElementCycler(
             anchor_df["Element_numberX"].unique().tolist(), self.rng
         )
 
-        os.makedirs(config.output_dir, exist_ok=True)
-        os.makedirs(config.log_dir, exist_ok=True)
+    # ── rollout ─────────────────────────────────────────────────────
 
-    def run(self, max_steps: int | None = None):
-        max_steps = max_steps or self.config.max_steps
-        diagnostics = []
-
-        for step in range(max_steps):
-            batch = sample_ppo_batch(
-                self.anchor_df,
-                self.rubric_reward,
-                self.element_cycler,
-                batch_size=self.config.batch_size,
-                rng=self.rng,
+    @torch.no_grad()
+    def _rollout(self, specs: list[dict]):
+        """
+        Generates one completion per spec and records the log-probs and
+        values needed for the PPO update.
+        """
+        prompts = [
+            build_generation_prompt(
+                s["element"], s["target_score"],
+                s["rubric_text"], s["anchor_text"],
             )
+            for s in specs
+        ]
 
-            prompts = [
-                build_ppo_prompt(
-                    b["element"], b["target_score"],
-                    b["rubric_text"], b["anchor_text"],
-                )
-                for b in batch
-            ]
+        enc = self.tokenizer(
+            prompts, return_tensors="pt", padding=True,
+            truncation=True, max_length=1024,
+        ).to(self.device)
 
-            query_tensors = [
-                self.tokenizer(p, return_tensors="pt", truncation=True,
-                                max_length=768).input_ids[0].to(self.device)
-                for p in prompts
-            ]
+        gen = self.policy.generate(
+            **enc,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            temperature=self.temperature,
+            top_p=0.95,
+            pad_token_id=self.tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+        )
 
-            response_tensors = self.trainer.generate(
-                query_tensors,
-                max_new_tokens=300,
-                do_sample=True,
-                temperature=0.8,
-                pad_token_id=self.tokenizer.eos_token_id,
+        seqs = gen.sequences
+        prompt_len = enc["input_ids"].shape[1]
+
+        texts = [
+            self.tokenizer.decode(s[prompt_len:], skip_special_tokens=True).strip()
+            for s in seqs
+        ]
+
+        attn = (seqs != self.tokenizer.pad_token_id).long()
+
+        # policy log-probs and values under the current adapter
+        out = self.policy(
+            input_ids=seqs, attention_mask=attn, output_hidden_states=True,
+        )
+        logits = out.logits[:, :-1, :]
+        targets = seqs[:, 1:]
+        logprobs = torch.log_softmax(logits.float(), dim=-1)
+        token_logprobs = torch.gather(
+            logprobs, 2, targets.unsqueeze(-1)
+        ).squeeze(-1)
+
+        values = self.value_head(out.hidden_states[-1][:, :-1, :])
+
+        # reference log-probs with the adapter disabled
+        with self.policy.disable_adapter():
+            ref_out = self.policy(input_ids=seqs, attention_mask=attn)
+            ref_logprobs = torch.log_softmax(
+                ref_out.logits[:, :-1, :].float(), dim=-1
             )
+            ref_token_logprobs = torch.gather(
+                ref_logprobs, 2, targets.unsqueeze(-1)
+            ).squeeze(-1)
 
-            responses = [
-                self.tokenizer.decode(r, skip_special_tokens=True)
-                for r in response_tensors
-            ]
+        # mask to completion tokens only; prompt tokens are not actions
+        mask = torch.zeros_like(token_logprobs)
+        mask[:, prompt_len - 1:] = 1.0
+        mask = mask * attn[:, 1:].float()
 
-            elements = [b["element"] for b in batch]
-            target_scores = [b["target_score"] for b in batch]
+        return {
+            "sequences": seqs,
+            "attention_mask": attn,
+            "texts": texts,
+            "logprobs": token_logprobs,
+            "ref_logprobs": ref_token_logprobs,
+            "values": values,
+            "mask": mask,
+            "prompt_len": prompt_len,
+        }
 
-            reward_outputs = self.combined_reward.score(
-                responses, elements, target_scores,
+    # ── reward ──────────────────────────────────────────────────────
+
+    def _compute_rewards(self, texts, specs):
+        valid = [i for i, t in enumerate(texts) if len(t.split()) >= 10]
+        auth = np.zeros(len(texts))
+        rub = np.zeros(len(texts))
+
+        if valid:
+            vt = [texts[i] for i in valid]
+            va = self.auth.score_batch(vt, batch_size=4, normalize=True)
+            vr = self.rubric.score(
+                vt,
+                [specs[i]["element"] for i in valid],
+                [specs[i]["target_score"] for i in valid],
             )
-            rewards = [torch.tensor(o.final) for o in reward_outputs]
+            for j, i in enumerate(valid):
+                auth[i] = va[j]
+                rub[i] = vr[j]
 
-            stats = self.trainer.step(query_tensors, response_tensors, rewards)
+        combined = self.alpha * auth + (1 - self.alpha) * rub
+        return combined, auth, rub
 
-            mean_auth = float(np.mean([o.authenticity for o in reward_outputs]))
-            mean_rubric = float(np.mean([o.rubric for o in reward_outputs]))
-            mean_combined = float(np.mean([o.combined for o in reward_outputs]))
-            element_counts = {e: elements.count(e) for e in set(elements)}
-            kl = stats.get("objective/kl", None)
+    # ── advantages ──────────────────────────────────────────────────
 
-            diagnostics.append({
-                "step": step,
-                "mean_authenticity": mean_auth,
-                "mean_rubric": mean_rubric,
-                "mean_combined": mean_combined,
-                "kl": kl,
-                "element_counts": element_counts,
-            })
+    def _gae(self, rewards, values, mask):
+        """
+        Generalized advantage estimation.
 
-            if step % 10 == 0:
-                print(f"step={step} auth={mean_auth:.4f} "
-                      f"rubric={mean_rubric:.4f} combined={mean_combined:.4f} "
-                      f"kl={kl} elements={element_counts}")
+        The reward is a single scalar per sequence, placed at the final
+        completion token. Intermediate tokens get zero, so the value
+        function carries credit assignment backward through the
+        sequence.
+        """
+        adv = torch.zeros_like(values)
+        lastgae = torch.zeros(values.shape[0], device=values.device)
 
-            if step % self.config.save_every == 0 and step > 0:
-                ckpt_dir = f"{self.config.output_dir}/checkpoint-{step}"
-                self.model.save_pretrained(ckpt_dir)
-                self._save_diagnostics(diagnostics)
+        for t in reversed(range(values.shape[1])):
+            nextval = values[:, t + 1] if t + 1 < values.shape[1] \
+                else torch.zeros_like(values[:, t])
+            nextmask = mask[:, t + 1] if t + 1 < mask.shape[1] \
+                else torch.zeros_like(mask[:, t])
+            delta = rewards[:, t] + self.gamma * nextval * nextmask - values[:, t]
+            lastgae = delta + self.gamma * self.lam * nextmask * lastgae
+            adv[:, t] = lastgae
 
-        self.model.save_pretrained(self.config.output_dir)
-        self.tokenizer.save_pretrained(self.config.output_dir)
-        self._save_diagnostics(diagnostics)
-        print(f"PPO training complete. Saved to {self.config.output_dir}")
+        returns = adv + values
+        return adv, returns
 
-    def _save_diagnostics(self, diagnostics: list[dict]):
-        path = Path(self.config.log_dir) / "ppo_diagnostics.json"
-        with open(path, "w") as f:
-            json.dump(diagnostics, f, indent=2)
+    # ── training step ───────────────────────────────────────────────
+
+    def step(self, specs: list[dict]) -> dict:
+        roll = self._rollout(specs)
+        combined, auth, rub = self._compute_rewards(roll["texts"], specs)
+
+        mask = roll["mask"]
+        seq_lens = mask.sum(dim=1).long()
+
+        # KL penalty per token, subtracted from the terminal reward
+        kl = (roll["logprobs"] - roll["ref_logprobs"]) * mask
+        kl_per_seq = kl.sum(dim=1)
+
+        reward_t = torch.zeros_like(roll["logprobs"])
+        for i in range(len(specs)):
+            last = max(int(seq_lens[i].item()) - 1, 0)
+            pos = roll["prompt_len"] - 1 + last
+            pos = min(pos, reward_t.shape[1] - 1)
+            reward_t[i, pos] = combined[i]
+
+        reward_t = reward_t - self.kl_coef * kl
+
+        with torch.no_grad():
+            adv, returns = self._gae(
+                reward_t, roll["values"].float(), mask
+            )
+            adv_masked = adv * mask
+            n = mask.sum().clamp(min=1)
+            mean = adv_masked.sum() / n
+            var = ((adv_masked - mean) ** 2 * mask).sum() / n
+            adv = (adv - mean) / (var.sqrt() + 1e-8)
+
+        old_logprobs = roll["logprobs"].detach()
+
+        stats = {}
+        for _ in range(self.ppo_epochs):
+            out = self.policy(
+                input_ids=roll["sequences"],
+                attention_mask=roll["attention_mask"],
+                output_hidden_states=True,
+            )
+            logits = out.logits[:, :-1, :]
+            targets = roll["sequences"][:, 1:]
+            lp = torch.log_softmax(logits.float(), dim=-1)
+            new_logprobs = torch.gather(
+                lp, 2, targets.unsqueeze(-1)
+            ).squeeze(-1)
+
+            new_values = self.value_head(
+                out.hidden_states[-1][:, :-1, :]
+            ).float()
+
+            ratio = torch.exp(new_logprobs - old_logprobs)
+            pg1 = -adv * ratio
+            pg2 = -adv * torch.clamp(
+                ratio, 1 - self.clip_range, 1 + self.clip_range
+            )
+            pg_loss = (torch.max(pg1, pg2) * mask).sum() / mask.sum().clamp(min=1)
+
+            v_loss = (((new_values - returns) ** 2) * mask).sum() \
+                / mask.sum().clamp(min=1)
+
+            loss = pg_loss + self.vf_coef * v_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in self.policy.parameters() if p.requires_grad]
+                + list(self.value_head.parameters()),
+                max_norm=1.0,
+            )
+            self.optimizer.step()
+
+            clipfrac = ((ratio - 1.0).abs() > self.clip_range).float()
+            clipfrac = (clipfrac * mask).sum() / mask.sum().clamp(min=1)
+
+            stats = {
+                "pg_loss": float(pg_loss.item()),
+                "value_loss": float(v_loss.item()),
+                "grad_norm": float(grad_norm),
+                "clip_frac": float(clipfrac.item()),
+                "ratio_mean": float(
+                    ((ratio * mask).sum() / mask.sum().clamp(min=1)).item()
+                ),
+            }
+
+        stats.update({
+            "reward_combined": float(np.mean(combined)),
+            "reward_auth": float(np.mean(auth)),
+            "reward_rubric": float(np.mean(rub)),
+            "kl": float(kl_per_seq.mean().item()),
+            "mean_gen_words": float(
+                np.mean([len(t.split()) for t in roll["texts"]])
+            ),
+            "distinct_frac": float(
+                np.mean([
+                    len(set(t.split())) / max(len(t.split()), 1)
+                    for t in roll["texts"]
+                ])
+            ),
+        })
+        return stats
+
+
+def check_divergence(history: list[dict], window: int = 50) -> list[str]:
+    """
+    Flags the standard silent PPO failure modes.
+
+    PPO can run to completion while learning nothing, so these are
+    checked every step rather than inspected afterward.
+    """
+    if len(history) < window * 2:
+        return []
+
+    recent = history[-window:]
+    prior = history[-2 * window:-window]
+    warns = []
+
+    r_now = np.mean([h["reward_combined"] for h in recent])
+    r_before = np.mean([h["reward_combined"] for h in prior])
+    if abs(r_now - r_before) < 0.005:
+        warns.append(
+            f"reward flat: {r_before:.4f} -> {r_now:.4f} over {window} steps"
+        )
+
+    kl_now = np.mean([h["kl"] for h in recent])
+    if kl_now > 50:
+        warns.append(f"KL exploding: {kl_now:.1f}; lower learning rate "
+                     f"or raise kl_coef")
+
+    v_now = np.mean([h["value_loss"] for h in recent])
+    v_before = np.mean([h["value_loss"] for h in prior])
+    if v_now > v_before * 1.5:
+        warns.append(f"value loss rising: {v_before:.4f} -> {v_now:.4f}; "
+                     f"the baseline is not fitting")
+
+    d_now = np.mean([h["distinct_frac"] for h in recent])
+    if d_now < 0.35:
+        warns.append(f"generation collapsing: distinct token fraction "
+                     f"{d_now:.3f}; likely reward hacking via repetition")
+
+    c_now = np.mean([h["clip_frac"] for h in recent])
+    if c_now > 0.5:
+        warns.append(f"clip fraction {c_now:.3f}; updates too large")
+
+    w_now = np.mean([h["mean_gen_words"] for h in recent])
+    if w_now < 15:
+        warns.append(f"generations collapsing to {w_now:.1f} words")
+
+    return warns

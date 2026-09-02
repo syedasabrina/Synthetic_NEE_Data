@@ -9,27 +9,41 @@ from peft import PeftModel
 
 class AuthenticityReward:
     """
-    Computes an authenticity reward for candidate synthetic BIPs using
-    a CONTRASTIVE perplexity signal, plus a repetition penalty.
+    Contrastive authenticity reward for candidate synthetic BIPs.
 
-    Why contrastive: raw perplexity under BIPDomainSFT measures general
-    fluency, not domain membership. Calibration showed off-domain text
-    ("The weather today is sunny...") scoring 0.63 while real BIP text
-    scored 0.61 -- short, clean, predictable English is easy for any
-    language model regardless of domain. Optimizing that signal would
-    push PPO toward generic fluent prose.
+    Raw perplexity under BIPDomainSFT measures general fluency, not
+    domain membership. Calibration showed off-domain text ("The weather
+    today is sunny...") scoring 0.63 against 0.61 for a real BIP --
+    short, clean English is easy for any language model regardless of
+    what it was fine-tuned on.
 
-    The contrastive signal measures how much EASIER the text is for the
-    domain-adapted model than for the base model:
+    The contrastive signal measures how much the domain fine-tune
+    specifically helped:
 
         delta = nll_base - nll_finetuned
 
-    Generic fluent text has delta near zero, since both models predict
-    it equally well. Real BIP text has large positive delta, because
-    fine-tuning specifically lowered its loss. That difference is what
-    "sounds like a principal wrote it" actually means.
+    Generic text has delta near zero because both models predict it
+    equally well. Real BIP text has large positive delta because
+    fine-tuning lowered its loss specifically. Measured deltas:
 
-    Both models are frozen -- neither is updated during PPO.
+        real BIP (Element3)   0.93
+        real BIP (Element6)   0.61
+        too short             0.18
+        repetitive            0.17
+        off-domain weather    0.11
+
+    Two guards sit on top of the contrastive score:
+
+    Repetition penalty. Repeated phrases are trivially predictable, so
+    they score well on any perplexity signal. A distinct-bigram ratio
+    multiplies the reward down.
+
+    Degenerate-text floor. Contrastive scoring discards absolute
+    perplexity, so text neither model can predict (nll_ft 7.53 for
+    "We monitored our goals") still scores on delta alone. A ceiling on
+    nll_finetuned catches that.
+
+    Both models frozen -- neither is updated during training.
     """
 
     def __init__(
@@ -37,17 +51,33 @@ class AuthenticityReward:
         base_model_name: str = "Qwen/Qwen2.5-7B",
         adapter_path: str = "models/BIPDomainSFT",
         device: str = "cuda",
+        nll_ceiling: float = 5.0,
+        delta_scale: float = 3.0,
+        delta_midpoint: float = 0.45,
     ):
+        """
+        nll_ceiling: candidates whose fine-tuned NLL exceeds this are
+        treated as degenerate and heavily penalized. Real BIPs sit
+        around 2.2-2.3; the "too short" probe hit 7.5.
+
+        delta_scale / delta_midpoint: shape the absolute-mode sigmoid.
+        Previously sigmoid(delta * 4.0) put delta=0.11 at 0.61, so
+        off-domain text kept a high floor. Centering on 0.45 -- between
+        the off-domain cluster (~0.15) and real BIPs (~0.6-0.9) -- maps
+        near-zero delta close to zero and real BIPs above 0.6.
+        """
         self.device = device
+        self.nll_ceiling = nll_ceiling
+        self.delta_scale = delta_scale
+        self.delta_midpoint = delta_midpoint
 
         print("Loading BIPDomainSFT authenticity reward model...")
         self.tokenizer = AutoTokenizer.from_pretrained(adapter_path)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # single base model load; the PEFT adapter can be toggled on and
-        # off, so we get both the base and fine-tuned distributions
-        # without paying for two full 7B models in memory
+        # one base model load; the PEFT adapter toggles on and off, so
+        # both distributions come from a single 7B in memory
         base = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             dtype=torch.bfloat16,
@@ -62,26 +92,19 @@ class AuthenticityReward:
         print("AuthenticityReward ready (contrastive mode).")
 
     def _repetition_score(self, text: str) -> float:
-        """
-        Distinct-bigram ratio in [0, 1]. Higher means less repetitive.
-        Multiplies down candidates that repeat phrases, which would
-        otherwise score well on any perplexity-based signal.
-        """
         tokens = text.split()
         if len(tokens) < 2:
-            return 0.3  # too short to judge, and short generic text
-                        # is exactly the failure mode we are guarding
-                        # against, so do not award a neutral score
+            return 0.2
         bigrams = list(zip(tokens, tokens[1:]))
         if not bigrams:
-            return 0.3
+            return 0.2
         return len(set(bigrams)) / len(bigrams)
 
     @torch.no_grad()
     def _nll_batch(self, texts: list[str], batch_size: int) -> np.ndarray:
         """
-        Per-example mean NLL under whichever adapter state is currently
-        active on self.model. Caller controls adapter state.
+        Per-example mean NLL under whichever adapter state is active.
+        Caller controls adapter state.
         """
         all_nlls = []
 
@@ -131,28 +154,24 @@ class AuthenticityReward:
         return_components: bool = False,
     ):
         """
-        Returns an authenticity reward per candidate.
+        Authenticity reward per candidate.
 
-        The reward combines a contrastive domain-fit signal with a
-        repetition penalty:
+            delta    = nll_base - nll_finetuned
+            fit      = sigmoid((delta - midpoint) * scale)   [absolute]
+                       or batch z-scored sigmoid             [normalized]
+            floor    = 0 if nll_finetuned > nll_ceiling else 1
+            reward   = fit * repetition * floor
 
-            delta   = nll_base - nll_finetuned   (higher = more domain-like)
-            fit     = sigmoid(delta)  or  batch z-scored sigmoid
-            reward  = fit * repetition_score
+        normalize=True (used in training loops): delta is z-scored
+        within the batch, so the reward reflects relative standing
+        among candidates produced in the same step. This gives a
+        well-spread signal rather than values bunched near a point.
 
-        normalize=True (used during PPO): delta is z-scored within the
-        batch before the sigmoid, so the reward reflects relative
-        standing among candidates the generator produced in that step.
-        This gives PPO a well-spread signal instead of values bunched
-        near a fixed point.
-
-        normalize=False: absolute sigmoid(delta), for comparing
-        hand-written examples across separate calls.
+        normalize=False: absolute sigmoid, for comparing hand-written
+        probes across separate calls.
         """
-        # fine-tuned distribution
         nll_ft = self._nll_batch(texts, batch_size)
 
-        # base distribution: disable the LoRA adapter
         with self.model.disable_adapter():
             nll_base = self._nll_batch(texts, batch_size)
 
@@ -166,12 +185,14 @@ class AuthenticityReward:
                 z = (delta - delta.mean()) / std
                 fit = 1.0 / (1.0 + np.exp(-z))
         else:
-            # absolute mode: delta is typically small in magnitude, so
-            # scale before the sigmoid to spread the output range
-            fit = 1.0 / (1.0 + np.exp(-delta * 4.0))
+            fit = 1.0 / (1.0 + np.exp(
+                -(delta - self.delta_midpoint) * self.delta_scale
+            ))
 
         rep = np.array([self._repetition_score(t) for t in texts])
-        reward = fit * rep
+        floor = (nll_ft <= self.nll_ceiling).astype(float)
+
+        reward = fit * rep * floor
 
         if return_components:
             return {
@@ -181,12 +202,11 @@ class AuthenticityReward:
                 "delta": delta.tolist(),
                 "fit": fit.tolist(),
                 "repetition": rep.tolist(),
+                "floor": floor.tolist(),
             }
         return reward.tolist()
 
     @torch.no_grad()
     def score(self, texts: list[str]) -> list[float]:
-        """
-        Absolute (non batch-normalized) scoring, for diagnostics.
-        """
+        """Absolute (non batch-normalized) scoring, for diagnostics."""
         return self.score_batch(texts, batch_size=4, normalize=False)

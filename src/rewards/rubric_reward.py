@@ -8,16 +8,13 @@ from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
 
 class RubricReward:
     """
-    Computes a rubric alignment reward for candidate synthetic BIPs
-    using Gemma 4 E4B as a frozen few-shot rubric judge.
+    Rubric alignment reward using Gemma 4 E4B as a frozen few-shot judge.
 
     The judge is BLIND to the target score: it sees all three rubric
     levels and picks one independently. The reward is computed outside
-    the model by comparing that blind prediction to the target. Telling
-    the judge the target and asking whether it agrees would bias an
-    instruction-tuned model toward agreement regardless of quality.
+    the model by comparing that blind prediction to the target.
 
-    This model is always frozen -- it is never updated during PPO.
+    Frozen at all times -- never updated during training.
     """
 
     RUBRIC = {
@@ -65,23 +62,27 @@ class RubricReward:
         few_shot_examples: dict | None = None,
         max_new_tokens: int = 24,
         max_example_chars: int = 900,
+        use_chat_template: bool = True,
     ):
         """
-        max_new_tokens defaults to 24 rather than 5. Calibration with a
-        5-token budget produced unparseable output on 93 of 171 gold
-        BIPs, because the model preambles before emitting a digit and
-        gets truncated mid-sentence. 24 tokens reaches the number
-        without inviting a full explanation.
+        use_chat_template: Gemma 4 E4B is instruction tuned. Feeding it a
+        raw string outside its expected chat format caused 30 of 171 gold
+        BIPs to return an empty string -- the model emitted only special
+        tokens. Wrapping the prompt with apply_chat_template puts it in
+        the format the model was tuned for.
 
-        max_example_chars truncates few-shot demonstrations. Real BIPs
-        run to hundreds of tokens each; three full examples plus the
-        candidate can crowd the instruction out of context, which is a
-        second cause of unparseable output.
+        max_new_tokens 24 (not 5): a 5 token budget truncated the model
+        mid-preamble before it reached a digit.
+
+        max_example_chars: real BIPs run to hundreds of tokens. Three
+        untruncated few-shot examples plus the candidate crowded the
+        instruction out of the usable context.
         """
         self.device = device
         self.few_shot_examples = few_shot_examples or {}
         self.max_new_tokens = max_new_tokens
         self.max_example_chars = max_example_chars
+        self.use_chat_template = use_chat_template
 
         print(f"Loading Gemma 4 rubric reward model: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -95,7 +96,15 @@ class RubricReward:
         for param in self.model.parameters():
             param.requires_grad = False
 
-        print("RubricReward ready.")
+        # fall back to raw prompting if the tokenizer has no template
+        if self.use_chat_template and not getattr(
+            self.tokenizer, "chat_template", None
+        ):
+            print("WARNING: tokenizer has no chat_template; "
+                  "falling back to raw prompting.")
+            self.use_chat_template = False
+
+        print(f"RubricReward ready (chat_template={self.use_chat_template}).")
 
     @classmethod
     def build_few_shot_examples(
@@ -107,16 +116,13 @@ class RubricReward:
         max_examples: int = 1,
     ) -> dict:
         """
-        Builds few-shot demonstrations from the gold standard set,
-        keyed by (element, score).
+        Few-shot demonstrations from the gold standard set, keyed by
+        (element, score). One per cell by default: the prompt already
+        shows three score levels, so more would put many full BIPs in
+        context before the candidate appears.
 
-        max_examples defaults to 1 per cell: the prompt already shows
-        three score levels, so three examples each would put nine BIPs
-        in context before the candidate appears.
-
-        Used only as frozen in-context demonstrations for a frozen
-        model. No gradients, no training. The gold set remains held out
-        for final assessor evaluation.
+        Frozen in-context demonstrations only. No gradients, no
+        training. The gold set stays held out for final evaluation.
         """
         examples = {}
         for (element, score), group in gold_df.groupby([element_col, score_col]):
@@ -161,20 +167,37 @@ Rubric criteria for {element}:
 BIP response to score:
 {candidate}
 
-Which score does this response earn? Answer with a single number: 0, 2, or 4.
-Score:"""
+Which score does this response earn? Reply with only the number 0, 2, or 4."""
 
         return prompt
 
+    def _encode(self, prompt: str):
+        """
+        Applies the chat template when available, so the instruction
+        tuned model receives input in the format it expects.
+        """
+        if self.use_chat_template:
+            text = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            text = prompt + "\nScore:"
+
+        return self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=3072,
+        ).to(self.device)
+
     def _parse_score(self, generated: str) -> int | None:
         """
-        Extracts the first 0, 2, or 4 appearing anywhere in the output.
-
-        The previous implementation split on whitespace and required an
-        exact token match, so output like "Score: 2." or "**2**" or
-        "I would say 2" failed to parse. Regex over the raw string
-        matches how instruction-tuned models actually format short
-        answers.
+        First 0, 2, or 4 anywhere in the output. Regex rather than
+        whitespace token matching, since instruction tuned models
+        format short answers as "Score: 2." or "**2**" or "I would
+        say 2" -- all of which failed exact token matching.
         """
         m = re.search(r"[024]", generated)
         return int(m.group(0)) if m else None
@@ -187,23 +210,15 @@ Score:"""
         return_raw: bool = False,
     ):
         """
-        Blind score prediction, with no knowledge of any target score.
-
-        return_raw=True also returns the decoded model output per
-        candidate, so unparseable cases can be inspected rather than
-        silently counted.
+        Blind score prediction with no knowledge of any target score.
+        return_raw also returns decoded output per candidate so
+        unparseable cases can be inspected.
         """
         predictions, raw_outputs = [], []
 
         for candidate, element in zip(candidates, elements):
             prompt = self._build_prompt(element, candidate)
-
-            inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=3072,
-            ).to(self.device)
+            inputs = self._encode(prompt)
 
             outputs = self.model.generate(
                 **inputs,
@@ -231,8 +246,7 @@ Score:"""
         target_scores: list[int],
     ) -> list[float]:
         """
-        Rubric alignment reward per candidate:
-
+        Rubric alignment reward:
             1.0  predicted score matches target exactly
             0.5  predicted score is one rubric level away
             0.0  far off, or unparseable
