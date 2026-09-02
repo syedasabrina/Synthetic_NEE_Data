@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import torch
 from pathlib import Path
 from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
@@ -10,13 +11,11 @@ class RubricReward:
     Computes a rubric alignment reward for candidate synthetic BIPs
     using Gemma 4 E4B as a frozen few-shot rubric judge.
 
-    The judge is BLIND to the target score -- it is shown all three
-    rubric levels and asked to independently determine which one the
-    candidate earns. The target score is only used afterward, outside
-    the model, to compute the reward. This matters because revealing
-    the target and asking "does this earn a {target}?" biases an
-    instruction-tuned model toward agreement regardless of actual
-    quality.
+    The judge is BLIND to the target score: it sees all three rubric
+    levels and picks one independently. The reward is computed outside
+    the model by comparing that blind prediction to the target. Telling
+    the judge the target and asking whether it agrees would bias an
+    instruction-tuned model toward agreement regardless of quality.
 
     This model is always frozen -- it is never updated during PPO.
     """
@@ -64,25 +63,31 @@ class RubricReward:
         model_name: str = "google/gemma-4-E4B-it",
         device: str = "cuda",
         few_shot_examples: dict | None = None,
+        max_new_tokens: int = 24,
+        max_example_chars: int = 900,
     ):
         """
-        few_shot_examples: dict keyed by (element, score) -> list[str]
-        of real BIP texts known to earn that score. Populate this
-        using build_few_shot_examples() on the gold standard set
-        before instantiating, e.g.:
+        max_new_tokens defaults to 24 rather than 5. Calibration with a
+        5-token budget produced unparseable output on 93 of 171 gold
+        BIPs, because the model preambles before emitting a digit and
+        gets truncated mid-sentence. 24 tokens reaches the number
+        without inviting a full explanation.
 
-            gold_df = load_gold_standard(...)
-            fs = RubricReward.build_few_shot_examples(gold_df)
-            judge = RubricReward(few_shot_examples=fs)
+        max_example_chars truncates few-shot demonstrations. Real BIPs
+        run to hundreds of tokens each; three full examples plus the
+        candidate can crowd the instruction out of context, which is a
+        second cause of unparseable output.
         """
         self.device = device
         self.few_shot_examples = few_shot_examples or {}
+        self.max_new_tokens = max_new_tokens
+        self.max_example_chars = max_example_chars
 
         print(f"Loading Gemma 4 rubric reward model: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = Gemma4ForConditionalGeneration.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map=device,
         )
         self.model.eval()
@@ -99,24 +104,34 @@ class RubricReward:
         text_col: str = "Text",
         element_col: str = "Element_numberX",
         score_col: str = "score",
-        max_examples: int = 3,
+        max_examples: int = 1,
     ) -> dict:
         """
-        Builds the few_shot_examples dict from the 23 gold standard
-        BIPs, grouped by (element, score). Used only as frozen
-        in-context demonstrations -- never as training data. The
-        gold standard set remains held out for final evaluation.
+        Builds few-shot demonstrations from the gold standard set,
+        keyed by (element, score).
+
+        max_examples defaults to 1 per cell: the prompt already shows
+        three score levels, so three examples each would put nine BIPs
+        in context before the candidate appears.
+
+        Used only as frozen in-context demonstrations for a frozen
+        model. No gradients, no training. The gold set remains held out
+        for final assessor evaluation.
         """
         examples = {}
         for (element, score), group in gold_df.groupby([element_col, score_col]):
             examples[(element, int(score))] = group[text_col].tolist()[:max_examples]
         return examples
 
+    def _truncate(self, text: str) -> str:
+        if len(text) <= self.max_example_chars:
+            return text
+        return text[: self.max_example_chars].rsplit(" ", 1)[0] + " ..."
+
     def _build_prompt(self, element: str, candidate: str) -> str:
         """
-        Builds a BLIND scoring prompt. All three rubric levels are
-        shown; the model must independently pick one. The target
-        score is never mentioned here.
+        Blind scoring prompt. All three rubric levels shown; the target
+        score is never mentioned.
         """
         criteria_block = "\n".join(
             f"Score {score}: {text}"
@@ -125,42 +140,60 @@ class RubricReward:
 
         prompt = f"""You are an expert evaluator of school principal Building Improvement Plans (BIPs).
 
-You will independently score a BIP response for {element} according to the NEE rubric below. Do not assume any particular score -- judge based only on the content of the response.
+Score the BIP response below for {element} using the NEE rubric. Judge only on the content of the response.
 
 Rubric criteria for {element}:
 {criteria_block}
-
 """
-        # attach few-shot examples across all three score levels if available,
-        # so the judge sees calibration anchors without knowing which
-        # level the candidate should hit
-        any_examples = False
+
+        example_block = ""
         for score in (0, 2, 4):
             examples = self.few_shot_examples.get((element, score), [])
             if examples:
-                if not any_examples:
-                    prompt += "Reference examples at each score level:\n\n"
-                    any_examples = True
-                prompt += f"Example earning score {score}:\n{examples[0]}\n\n"
+                example_block += (
+                    f"\nExample of a response scoring {score}:\n"
+                    f"{self._truncate(examples[0])}\n"
+                )
+        if example_block:
+            prompt += "\nReference examples at each score level:\n" + example_block
 
-        prompt += f"""Now read the following BIP response and determine which
-score (0, 2, or 4) it earns.
-
-BIP response:
+        prompt += f"""
+BIP response to score:
 {candidate}
 
-Respond with only a number: 0, 2, or 4.
+Which score does this response earn? Answer with a single number: 0, 2, or 4.
 Score:"""
 
         return prompt
 
+    def _parse_score(self, generated: str) -> int | None:
+        """
+        Extracts the first 0, 2, or 4 appearing anywhere in the output.
+
+        The previous implementation split on whitespace and required an
+        exact token match, so output like "Score: 2." or "**2**" or
+        "I would say 2" failed to parse. Regex over the raw string
+        matches how instruction-tuned models actually format short
+        answers.
+        """
+        m = re.search(r"[024]", generated)
+        return int(m.group(0)) if m else None
+
     @torch.no_grad()
-    def predict(self, candidates: list[str], elements: list[str]) -> list[int | None]:
+    def predict(
+        self,
+        candidates: list[str],
+        elements: list[str],
+        return_raw: bool = False,
+    ):
         """
-        Returns the judge's independently predicted score for each
-        candidate, with no knowledge of any intended target score.
+        Blind score prediction, with no knowledge of any target score.
+
+        return_raw=True also returns the decoded model output per
+        candidate, so unparseable cases can be inspected rather than
+        silently counted.
         """
-        predictions = []
+        predictions, raw_outputs = [], []
 
         for candidate, element in zip(candidates, elements):
             prompt = self._build_prompt(element, candidate)
@@ -169,12 +202,12 @@ Score:"""
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=1536,
+                max_length=3072,
             ).to(self.device)
 
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=5,
+                max_new_tokens=self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
@@ -185,7 +218,10 @@ Score:"""
             ).strip()
 
             predictions.append(self._parse_score(generated))
+            raw_outputs.append(generated)
 
+        if return_raw:
+            return predictions, raw_outputs
         return predictions
 
     def score(
@@ -195,26 +231,17 @@ Score:"""
         target_scores: list[int],
     ) -> list[float]:
         """
-        Scores a list of candidate BIPs for rubric alignment. The
-        judge predicts blind (see predict()); reward is computed
-        afterward by comparing the blind prediction to target_scores.
+        Rubric alignment reward per candidate:
 
-            1.0  -- predicted score matches target score exactly
-            0.5  -- predicted score is adjacent (one rubric step away)
-            0.0  -- predicted score is far off or unparseable
+            1.0  predicted score matches target exactly
+            0.5  predicted score is one rubric level away
+            0.0  far off, or unparseable
         """
-        predicted_scores = self.predict(candidates, elements)
+        predicted = self.predict(candidates, elements)
         return [
-            self._compute_reward(pred, target)
-            for pred, target in zip(predicted_scores, target_scores)
+            self._compute_reward(p, t)
+            for p, t in zip(predicted, target_scores)
         ]
-
-    def _parse_score(self, generated: str) -> int | None:
-        for token in generated.split():
-            cleaned = token.strip(".,;:")
-            if cleaned in ("0", "2", "4"):
-                return int(cleaned)
-        return None
 
     def _compute_reward(self, predicted: int | None, target: int) -> float:
         if predicted is None:
@@ -224,40 +251,3 @@ Score:"""
         if abs(predicted - target) == 2:
             return 0.5
         return 0.0
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-    judge = RubricReward(model_name="google/gemma-4-E4B-it", device="cuda")
-
-    candidates = [
-        "Throughout the school year, we monitored our building "
-        "improvement objectives by collecting MAP data every eight "
-        "weeks and reviewing results with our grade level teams. "
-        "When data showed students were not making expected progress "
-        "in reading fluency, we implemented small group intervention "
-        "blocks three times per week and adjusted our pacing guide.",
-
-        "We monitored our goals.",
-
-        "Our BIP objectives are directly aligned to the district "
-        "CSIP goals for 2023-2024. Objective 1 supports CSIP Goal 2 "
-        "around increasing ELA proficiency. Objective 2 supports "
-        "CSIP Goal 3 around improving math benchmark scores. "
-        "Each objective includes a measurable target tied to "
-        "district performance indicators.",
-    ]
-
-    elements = ["Element6", "Element6", "Element3"]
-    target_scores = [4, 4, 4]
-
-    print("Testing BLIND rubric alignment scoring:")
-    predicted = judge.predict(candidates, elements)
-    rewards = judge.score(candidates, elements, target_scores)
-    for cand, elem, target, pred, reward in zip(
-        candidates, elements, target_scores, predicted, rewards
-    ):
-        print(f"  {elem} | predicted={pred} target={target} "
-              f"reward={reward:.1f} | {cand[:50]}...")
