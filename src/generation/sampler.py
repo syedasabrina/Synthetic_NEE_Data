@@ -49,7 +49,7 @@ class CandidateSampler:
         base_model_name: str = "google/gemma-4-E4B-it",
         adapter_path: str = "models/GeneratorSFT",
         device: str = "cuda",
-        max_new_tokens: int = 320,
+        max_new_tokens: int = 512,
         temperature: float = 0.9,
         top_p: float = 0.95,
     ):
