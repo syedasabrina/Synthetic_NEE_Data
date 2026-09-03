@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 from pathlib import Path
@@ -29,11 +30,14 @@ class BestOfNRound:
 
     Why this rather than policy-gradient optimization: the reward is a
     Python function that decodes text and calls two separate language
-    models. Selection only requires that the reward RANK candidates
-    correctly within a prompt, so the judge's known harshness (mean
-    signed deviation -0.47 against expert scores) cancels out. A
-    gradient method would propagate that bias into the policy, since
-    reward magnitude enters the update directly.
+    models, which does not fit TRL's get_reward interface. Selection
+    also only requires that the reward RANK candidates correctly within
+    a prompt, so any uniform bias in the judge cancels out.
+
+    Device placement: the generator, authenticity model, and judge are
+    three large models. Holding all three plus optimizer state on one
+    A100 caused OOM during the retrain step. Each now takes its own
+    device, and release() frees them before retraining begins.
     """
 
     def __init__(
@@ -48,20 +52,10 @@ class BestOfNRound:
         min_reward: float = 0.0,
         anchor_similarity_threshold: float = 0.85,
         seed: int = 42,
-        device: str = "cuda",
+        generator_device: str = "cuda:0",
+        auth_device: str = "cuda:1",
+        rubric_device: str = "cuda:2",
     ):
-        """
-        n_candidates / keep_top_k: 8 and 2 gives a 4:1 rejection ratio.
-        Higher N raises quality but costs inference linearly.
-
-        min_reward: absolute floor on combined reward. Without it, a
-        prompt where all N candidates are poor still contributes its
-        top 2 to training, teaching the generator from the best of a
-        bad batch. Set above 0 to drop those prompts entirely.
-
-        alpha: weight on authenticity vs rubric alignment in the
-        combined reward.
-        """
         self.anchor_df = anchor_df
         self.output_dir = Path(output_dir)
         self.n_candidates = n_candidates
@@ -73,31 +67,55 @@ class BestOfNRound:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-        print("Loading reward models...")
-        self.auth = AuthenticityReward(device=device)
+        n_gpu = torch.cuda.device_count()
+        print(f"Visible GPUs: {n_gpu}")
+        if n_gpu < 3:
+            print(f"WARNING: only {n_gpu} GPU(s); placing all models on "
+                  f"cuda:0. Expect OOM at the retrain step.")
+            generator_device = auth_device = rubric_device = "cuda:0"
+
+        print(f"Placement: generator={generator_device}  "
+              f"auth={auth_device}  rubric={rubric_device}")
+
+        self.auth = AuthenticityReward(device=auth_device)
 
         few_shot = RubricReward.build_few_shot_examples(gold_df, max_examples=1)
         self.rubric = RubricReward(
-            device=device, few_shot_examples=few_shot
+            device=rubric_device,
+            few_shot_examples=few_shot,
+            batch_size=n_candidates,
         )
 
-        print("Loading generator...")
         self.sampler = CandidateSampler(
-            adapter_path=generator_adapter, device=device
+            adapter_path=generator_adapter, device=generator_device
         )
 
         self.element_cycler = ElementCycler(
             anchor_df["Element_numberX"].unique().tolist(), self.rng
         )
 
+    def release(self):
+        """
+        Frees the generator and both reward models.
+
+        Generation and scoring are fully finished before retraining
+        starts, so nothing here is needed afterward. Without this the
+        retrain step inherits ~30 GB of resident weights and OOMs while
+        allocating optimizer state.
+        """
+        for attr in ("sampler", "auth", "rubric"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("Released generation and reward models.")
+
     def _anchor_overlap(self, candidate: str, anchor: str) -> float:
         """
-        Word-level Jaccard overlap between candidate and anchor.
-
-        Guards against the generator copying its reference rather than
-        writing a new response. A lightweight proxy for embedding
-        similarity, chosen to avoid loading a third model inside the
-        generation loop.
+        Word-level Jaccard overlap between candidate and anchor. Guards
+        against the generator copying its reference. A lightweight
+        proxy for embedding similarity, chosen to avoid loading a third
+        model inside the generation loop.
         """
         a = set(candidate.lower().split())
         b = set(anchor.lower().split())
@@ -105,15 +123,7 @@ class BestOfNRound:
             return 0.0
         return len(a & b) / len(a | b)
 
-    def run(
-        self,
-        n_prompts: int = 500,
-        log_every: int = 25,
-    ) -> pd.DataFrame:
-        """
-        Generates and scores candidates across n_prompts, returning the
-        accepted set as a DataFrame.
-        """
+    def run(self, n_prompts: int = 500, log_every: int = 25) -> pd.DataFrame:
         accepted_rows = []
         all_scores = []
         rejected_leakage = 0
@@ -125,20 +135,15 @@ class BestOfNRound:
             )
 
             prompt = build_generation_prompt(
-                spec["element"],
-                spec["target_score"],
-                spec["rubric_text"],
-                spec["anchor_text"],
+                spec["element"], spec["target_score"],
+                spec["rubric_text"], spec["anchor_text"],
             )
 
             candidates = self.sampler.sample(prompt, n=self.n_candidates)
-
-            # drop empty generations before scoring
             candidates = [c for c in candidates if len(c.split()) >= 10]
             if not candidates:
                 continue
 
-            # anchor leakage filter
             keep = []
             for c in candidates:
                 if self._anchor_overlap(c, spec["anchor_text"]) \
@@ -192,7 +197,7 @@ class BestOfNRound:
                       f"accepted={len(accepted_rows)}  "
                       f"mean_combined={mean_c:.4f}  "
                       f"leakage_rejects={rejected_leakage}  "
-                      f"low_rejects={rejected_low}")
+                      f"low_rejects={rejected_low}", flush=True)
 
         df = pd.DataFrame(accepted_rows)
 
@@ -211,12 +216,8 @@ class BestOfNRound:
             "rejected_low_reward": rejected_low,
         }
         if len(df):
-            stats["accepted_by_score"] = (
-                df["target_score"].value_counts().to_dict()
-            )
-            stats["accepted_by_element"] = (
-                df["element"].value_counts().to_dict()
-            )
+            stats["accepted_by_score"] = df["target_score"].value_counts().to_dict()
+            stats["accepted_by_element"] = df["element"].value_counts().to_dict()
 
         with open(self.output_dir / "round_stats.json", "w") as f:
             json.dump(stats, f, indent=2, default=str)
@@ -241,11 +242,8 @@ def build_retrain_dataset(
     """
     Converts accepted candidates into a tokenized dataset for the next
     generator fine-tune. Prompt tokens are masked with -100 so loss is
-    computed only on the completion.
-
-    Mirrors the masking in generator_sft.build_sft_dataset, so each
-    round is the same training procedure applied to progressively
-    better data.
+    computed only on the completion, mirroring generator_sft so each
+    round is the same procedure applied to progressively better data.
     """
     hf = Dataset.from_dict({
         "prompt": accepted_df["prompt"].tolist(),

@@ -39,9 +39,9 @@ class CandidateSampler:
     """
     Samples N candidate BIPs per prompt from the current generator.
 
-    This is the generation half of best-of-n: produce many candidates,
-    let the reward models rank them, keep the best. The generator is
-    loaded from a LoRA checkpoint that advances each round.
+    The generation half of best-of-n: produce many candidates, let the
+    reward models rank them, keep the best. The generator loads from a
+    LoRA checkpoint that advances each round.
     """
 
     def __init__(
@@ -55,16 +55,17 @@ class CandidateSampler:
     ):
         """
         temperature 0.9 and top_p 0.95 are deliberately high. Best-of-n
-        depends on candidate diversity -- sampling N nearly identical
-        completions wastes the entire budget, since selecting the best
-        of eight copies of the same text gains nothing.
+        depends on candidate diversity; sampling N near-identical
+        completions wastes the budget, since selecting the best of
+        eight copies of the same text gains nothing.
         """
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
 
-        print(f"Loading generator: {base_model_name} + {adapter_path}")
+        print(f"Loading generator: {base_model_name} + {adapter_path} "
+              f"on {device}")
         self.tokenizer = AutoTokenizer.from_pretrained(adapter_path)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -90,10 +91,9 @@ class CandidateSampler:
         batch_size: int = 4,
     ) -> list[str]:
         """
-        Returns n candidate completions for a single prompt.
-
-        Generates in sub-batches via num_return_sequences so a large n
-        does not blow up memory on long prompts.
+        Returns n candidate completions for a single prompt, generated
+        in sub-batches via num_return_sequences so a large n does not
+        blow up memory on long prompts.
         """
         inputs = self.tokenizer(
             prompt,
@@ -125,6 +125,28 @@ class CandidateSampler:
             remaining -= k
 
         return candidates
+
+
+class ElementCycler:
+    """
+    Cycles through all seven elements in shuffled order, reshuffling on
+    exhaustion. Prevents element drift when sampling many prompts,
+    which matters because per-element anchor counts are uneven.
+    """
+
+    def __init__(self, elements: list[str], rng: np.random.Generator):
+        self.elements = list(elements)
+        self.rng = rng
+        self.rng.shuffle(self.elements)
+        self.idx = 0
+
+    def next(self) -> str:
+        if self.idx >= len(self.elements):
+            self.rng.shuffle(self.elements)
+            self.idx = 0
+        e = self.elements[self.idx]
+        self.idx += 1
+        return e
 
 
 def sample_prompt_spec(
@@ -168,25 +190,3 @@ def sample_prompt_spec(
         "anchor_text": row["Text"],
         "rubric_text": rubric_class.RUBRIC[element][target_score],
     }
-
-
-class ElementCycler:
-    """
-    Cycles through all seven elements in shuffled order, reshuffling on
-    exhaustion. Prevents element drift when sampling many prompts,
-    which matters because per-element anchor counts are uneven.
-    """
-
-    def __init__(self, elements: list[str], rng: np.random.Generator):
-        self.elements = list(elements)
-        self.rng = rng
-        self.rng.shuffle(self.elements)
-        self.idx = 0
-
-    def next(self) -> str:
-        if self.idx >= len(self.elements):
-            self.rng.shuffle(self.elements)
-            self.idx = 0
-        e = self.elements[self.idx]
-        self.idx += 1
-        return e

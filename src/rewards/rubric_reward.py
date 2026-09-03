@@ -14,6 +14,9 @@ class RubricReward:
     levels and picks one independently. The reward is computed outside
     the model by comparing that blind prediction to the target.
 
+    Calibration on the 171-row gold set: 171/171 parsed, exact
+    agreement 0.661, adjacent 0.988, mean signed deviation +0.000.
+
     Frozen at all times -- never updated during training.
     """
 
@@ -63,29 +66,41 @@ class RubricReward:
         max_new_tokens: int = 24,
         max_example_chars: int = 900,
         use_chat_template: bool = True,
+        batch_size: int = 8,
     ):
         """
-        use_chat_template: Gemma 4 E4B is instruction tuned. Feeding it a
-        raw string outside its expected chat format caused 30 of 171 gold
-        BIPs to return an empty string -- the model emitted only special
-        tokens. Wrapping the prompt with apply_chat_template puts it in
-        the format the model was tuned for.
+        device: accepts "cuda:2" and similar so the judge can sit on a
+        GPU separate from the model being trained. Three large models
+        on one device caused OOM; the interface here is text in, float
+        out, so nothing crosses device boundaries as tensors.
 
-        max_new_tokens 24 (not 5): a 5 token budget truncated the model
-        mid-preamble before it reached a digit.
+        use_chat_template: Gemma 4 E4B is instruction tuned. Feeding a
+        raw string outside its chat format caused 93 of 171 gold BIPs
+        to return empty output and skewed the predictions that did
+        parse. Applying the template fixed both the parse rate and a
+        -0.949 score bias.
 
-        max_example_chars: real BIPs run to hundreds of tokens. Three
-        untruncated few-shot examples plus the candidate crowded the
-        instruction out of the usable context.
+        batch_size: judge calls dominated round-1 wall time at roughly
+        70 s per prompt, largely because eight candidates were scored
+        one at a time.
         """
         self.device = device
         self.few_shot_examples = few_shot_examples or {}
         self.max_new_tokens = max_new_tokens
         self.max_example_chars = max_example_chars
         self.use_chat_template = use_chat_template
+        self.batch_size = batch_size
 
-        print(f"Loading Gemma 4 rubric reward model: {model_name}")
+        print(f"Loading Gemma 4 rubric reward model: {model_name} on {device}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # decoder-only batched generation requires left padding, or
+        # shorter sequences end up with pad tokens sitting between the
+        # prompt and the generated continuation
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         self.model = Gemma4ForConditionalGeneration.from_pretrained(
             model_name,
             dtype=torch.bfloat16,
@@ -96,7 +111,6 @@ class RubricReward:
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # fall back to raw prompting if the tokenizer has no template
         if self.use_chat_template and not getattr(
             self.tokenizer, "chat_template", None
         ):
@@ -104,7 +118,8 @@ class RubricReward:
                   "falling back to raw prompting.")
             self.use_chat_template = False
 
-        print(f"RubricReward ready (chat_template={self.use_chat_template}).")
+        print(f"RubricReward ready (chat_template={self.use_chat_template}, "
+              f"batch_size={batch_size}).")
 
     @classmethod
     def build_few_shot_examples(
@@ -117,12 +132,9 @@ class RubricReward:
     ) -> dict:
         """
         Few-shot demonstrations from the gold standard set, keyed by
-        (element, score). One per cell by default: the prompt already
-        shows three score levels, so more would put many full BIPs in
-        context before the candidate appears.
-
-        Frozen in-context demonstrations only. No gradients, no
-        training. The gold set stays held out for final evaluation.
+        (element, score). Frozen in-context demonstrations only; no
+        gradients, no training. The gold set stays held out for final
+        assessor evaluation.
         """
         examples = {}
         for (element, score), group in gold_df.groupby([element_col, score_col]):
@@ -135,10 +147,6 @@ class RubricReward:
         return text[: self.max_example_chars].rsplit(" ", 1)[0] + " ..."
 
     def _build_prompt(self, element: str, candidate: str) -> str:
-        """
-        Blind scoring prompt. All three rubric levels shown; the target
-        score is never mentioned.
-        """
         criteria_block = "\n".join(
             f"Score {score}: {text}"
             for score, text in sorted(self.RUBRIC[element].items())
@@ -171,33 +179,20 @@ Which score does this response earn? Reply with only the number 0, 2, or 4."""
 
         return prompt
 
-    def _encode(self, prompt: str):
-        """
-        Applies the chat template when available, so the instruction
-        tuned model receives input in the format it expects.
-        """
+    def _format(self, prompt: str) -> str:
         if self.use_chat_template:
-            text = self.tokenizer.apply_chat_template(
+            return self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 tokenize=False,
                 add_generation_prompt=True,
             )
-        else:
-            text = prompt + "\nScore:"
-
-        return self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=3072,
-        ).to(self.device)
+        return prompt + "\nScore:"
 
     def _parse_score(self, generated: str) -> int | None:
         """
         First 0, 2, or 4 anywhere in the output. Regex rather than
         whitespace token matching, since instruction tuned models
-        format short answers as "Score: 2." or "**2**" or "I would
-        say 2" -- all of which failed exact token matching.
+        format short answers as "Score: 2." or "**2**".
         """
         m = re.search(r"[024]", generated)
         return int(m.group(0)) if m else None
@@ -210,30 +205,43 @@ Which score does this response earn? Reply with only the number 0, 2, or 4."""
         return_raw: bool = False,
     ):
         """
-        Blind score prediction with no knowledge of any target score.
-        return_raw also returns decoded output per candidate so
-        unparseable cases can be inspected.
+        Blind score prediction, batched. No knowledge of any target
+        score. return_raw also returns decoded output per candidate.
         """
+        texts = [
+            self._format(self._build_prompt(e, c))
+            for c, e in zip(candidates, elements)
+        ]
+
         predictions, raw_outputs = [], []
 
-        for candidate, element in zip(candidates, elements):
-            prompt = self._build_prompt(element, candidate)
-            inputs = self._encode(prompt)
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i: i + self.batch_size]
+
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=3072,
+            ).to(self.device)
 
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
 
-            generated = self.tokenizer.decode(
-                outputs[0][inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True,
-            ).strip()
-
-            predictions.append(self._parse_score(generated))
-            raw_outputs.append(generated)
+            # left padding means every sequence in the batch shares the
+            # same prompt length, so one slice point covers all of them
+            prompt_len = inputs["input_ids"].shape[1]
+            for seq in outputs:
+                gen = self.tokenizer.decode(
+                    seq[prompt_len:], skip_special_tokens=True
+                ).strip()
+                predictions.append(self._parse_score(gen))
+                raw_outputs.append(gen)
 
         if return_raw:
             return predictions, raw_outputs
