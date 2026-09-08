@@ -49,12 +49,31 @@ class CandidateSampler:
         base_model_name: str = "google/gemma-4-E4B-it",
         adapter_path: str = "models/GeneratorSFT",
         device: str = "cuda",
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 400,
         temperature: float = 0.9,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.15,
+        no_repeat_ngram_size: int = 4,
     ):
         """
-        temperature 0.9 and top_p 0.95 are deliberately high. Best-of-n
+        max_new_tokens 400 sits between two observed failure modes.
+        At 320, round 1 completions were all clipped at ~300 words with
+        the maximum pinned across every score level, so the model was
+        being trained on systematically truncated text. At 512, round 2
+        produced 358-word completions with a distinct-bigram ratio of
+        0.559 and 74% of accepted candidates below 0.7 -- the model
+        filled the extra budget by looping. Real BIPs have p50 at 150
+        tokens and p90 at 469, so most responses genuinely finish well
+        before 400.
+
+        repetition_penalty and no_repeat_ngram_size stop looping at the
+        decoder rather than penalizing it after the fact. The round 2
+        worst case repeated "The building principal and assistant
+        superintendent met to discuss the BIP and review the data"
+        eight times to fill its budget; no_repeat_ngram_size=4 makes
+        that structurally impossible.
+
+        temperature 0.9 and top_p 0.95 stay high on purpose. Best-of-n
         depends on candidate diversity; sampling N near-identical
         completions wastes the budget, since selecting the best of
         eight copies of the same text gains nothing.
@@ -63,6 +82,8 @@ class CandidateSampler:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
 
         print(f"Loading generator: {base_model_name} + {adapter_path} "
               f"on {device}")
@@ -81,7 +102,8 @@ class CandidateSampler:
         for param in self.model.parameters():
             param.requires_grad = False
 
-        print("CandidateSampler ready.")
+        print(f"CandidateSampler ready (max_new_tokens={max_new_tokens}, "
+              f"no_repeat_ngram={no_repeat_ngram_size}).")
 
     @torch.no_grad()
     def sample(
@@ -114,6 +136,8 @@ class CandidateSampler:
                 do_sample=True,
                 temperature=self.temperature,
                 top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
+                no_repeat_ngram_size=self.no_repeat_ngram_size,
                 num_return_sequences=k,
                 pad_token_id=self.tokenizer.eos_token_id,
             )

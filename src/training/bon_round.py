@@ -36,9 +36,20 @@ class BestOfNRound:
 
     Device placement: the generator, authenticity model, and judge are
     three large models. Holding all three plus optimizer state on one
-    A100 caused OOM during the retrain step. Each now takes its own
-    device, and release() frees them before retraining begins.
+    A100 caused OOM during the retrain step. Each takes its own device
+    when available, and release() frees them before retraining.
     """
+
+    # A candidate below this distinct-bigram ratio is degenerate and is
+    # rejected outright rather than merely penalized.
+    #
+    # Round 2 exposed why this is necessary. With max_new_tokens raised
+    # to 512, 74% of accepted candidates fell below 0.7, and the worst
+    # scored 0.038 -- one sentence repeated to fill the token budget.
+    # The soft multiplier could not prevent it: if all eight candidates
+    # for a prompt loop, selection keeps the least-looping loop.
+    # Best-of-n cannot select quality that was never sampled.
+    MIN_REPETITION = 0.60
 
     def __init__(
         self,
@@ -51,6 +62,7 @@ class BestOfNRound:
         alpha: float = 0.5,
         min_reward: float = 0.0,
         anchor_similarity_threshold: float = 0.85,
+        min_repetition: float | None = None,
         seed: int = 42,
         generator_device: str = "cuda:0",
         auth_device: str = "cuda:1",
@@ -63,6 +75,9 @@ class BestOfNRound:
         self.alpha = alpha
         self.min_reward = min_reward
         self.anchor_similarity_threshold = anchor_similarity_threshold
+        self.min_repetition = (
+            self.MIN_REPETITION if min_repetition is None else min_repetition
+        )
         self.rng = np.random.default_rng(seed)
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -71,7 +86,8 @@ class BestOfNRound:
         print(f"Visible GPUs: {n_gpu}")
         if n_gpu < 3:
             print(f"WARNING: only {n_gpu} GPU(s); placing all models on "
-                  f"cuda:0. Expect OOM at the retrain step.")
+                  f"cuda:0. Run generation with --skip_retrain and "
+                  f"retrain separately with --retrain_only.")
             generator_device = auth_device = rubric_device = "cuda:0"
 
         print(f"Placement: generator={generator_device}  "
@@ -99,9 +115,8 @@ class BestOfNRound:
         Frees the generator and both reward models.
 
         Generation and scoring are fully finished before retraining
-        starts, so nothing here is needed afterward. Without this the
-        retrain step inherits ~30 GB of resident weights and OOMs while
-        allocating optimizer state.
+        starts. Without this the retrain step inherits ~30 GB of
+        resident weights and OOMs while allocating optimizer state.
         """
         for attr in ("sampler", "auth", "rubric"):
             if hasattr(self, attr):
@@ -109,6 +124,16 @@ class BestOfNRound:
         gc.collect()
         torch.cuda.empty_cache()
         print("Released generation and reward models.")
+
+    def _repetition(self, text: str) -> float:
+        """
+        Distinct-bigram ratio in [0, 1]. Higher means less repetitive.
+        """
+        w = text.split()
+        if len(w) < 2:
+            return 0.0
+        b = list(zip(w, w[1:]))
+        return len(set(b)) / len(b)
 
     def _anchor_overlap(self, candidate: str, anchor: str) -> float:
         """
@@ -127,6 +152,7 @@ class BestOfNRound:
         accepted_rows = []
         all_scores = []
         rejected_leakage = 0
+        rejected_degenerate = 0
         rejected_low = 0
 
         for i in range(n_prompts):
@@ -144,9 +170,14 @@ class BestOfNRound:
             if not candidates:
                 continue
 
+            # hard filters applied before scoring: a degenerate or
+            # copied candidate should never enter the training set
+            # regardless of how it ranks against its siblings
             keep = []
             for c in candidates:
-                if self._anchor_overlap(c, spec["anchor_text"]) \
+                if self._repetition(c) < self.min_repetition:
+                    rejected_degenerate += 1
+                elif self._anchor_overlap(c, spec["anchor_text"]) \
                         > self.anchor_similarity_threshold:
                     rejected_leakage += 1
                 else:
@@ -158,8 +189,17 @@ class BestOfNRound:
             elements = [spec["element"]] * len(candidates)
             targets = [spec["target_score"]] * len(candidates)
 
+            # normalized scores drive selection: z-scoring within the
+            # batch spreads the signal across candidates for the same
+            # prompt, which is what ranking needs
             auth_scores = self.auth.score_batch(
                 candidates, batch_size=4, normalize=True
+            )
+            # absolute scores are logged for cross-round comparison.
+            # the normalized mean sits near 0.5 by construction, so it
+            # cannot show whether round N is better than round N-1.
+            auth_abs = self.auth.score_batch(
+                candidates, batch_size=4, normalize=False
             )
             rubric_scores = self.rubric.score(candidates, elements, targets)
 
@@ -184,8 +224,11 @@ class BestOfNRound:
                     "prompt": prompt,
                     "completion": candidates[idx],
                     "auth_reward": auth_scores[idx],
+                    "auth_reward_abs": auth_abs[idx],
                     "rubric_reward": rubric_scores[idx],
                     "combined_reward": combined[idx],
+                    "repetition": self._repetition(candidates[idx]),
+                    "n_words": len(candidates[idx].split()),
                 })
                 kept += 1
 
@@ -196,8 +239,9 @@ class BestOfNRound:
                 print(f"prompt {i+1}/{n_prompts}  "
                       f"accepted={len(accepted_rows)}  "
                       f"mean_combined={mean_c:.4f}  "
-                      f"leakage_rejects={rejected_leakage}  "
-                      f"low_rejects={rejected_low}", flush=True)
+                      f"degenerate={rejected_degenerate}  "
+                      f"leakage={rejected_leakage}  "
+                      f"low={rejected_low}", flush=True)
 
         df = pd.DataFrame(accepted_rows)
 
@@ -210,8 +254,18 @@ class BestOfNRound:
                 if len(df) else 0.0,
             "mean_auth_accepted": float(df["auth_reward"].mean())
                 if len(df) else 0.0,
+            # the comparable one across rounds
+            "mean_auth_abs_accepted": float(df["auth_reward_abs"].mean())
+                if len(df) else 0.0,
             "mean_rubric_accepted": float(df["rubric_reward"].mean())
                 if len(df) else 0.0,
+            "mean_repetition_accepted": float(df["repetition"].mean())
+                if len(df) else 0.0,
+            "frac_repetition_below_0.7": float((df["repetition"] < 0.7).mean())
+                if len(df) else 0.0,
+            "mean_words_accepted": float(df["n_words"].mean())
+                if len(df) else 0.0,
+            "rejected_degenerate": rejected_degenerate,
             "rejected_leakage": rejected_leakage,
             "rejected_low_reward": rejected_low,
         }

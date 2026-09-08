@@ -11,7 +11,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 #SBATCH --export=ALL
-#SBATCH --time=0-02:00:00
+#SBATCH --time=0-08:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=sakter6@gmu.edu
 
