@@ -1,7 +1,6 @@
 """
 src/utils/config.py
 Central configuration dataclasses for all pipeline modules.
-Instantiate directly or load from argparse / a config dict.
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ class CorpusConfig:
         "Element1", "Element2", "Element3",
         "Element4", "Element5", "Element6", "Element7"
     ])
-    # Elements 1-5 should not be evaluated for new principals per rubric note
+    # Elements 1-5 are not evaluated for new principals per the rubric
     evaluation_elements: list[str] = field(
         default_factory=lambda: ["Element6", "Element7"]
     )
@@ -38,14 +37,12 @@ class CorpusConfig:
 
 @dataclass
 class AnchorSamplerConfig:
-    # anchor pool after 50-token filter and score mapping:
-    # score 0: 31 BIPs  score 2: 406 BIPs  score 4: 8,961 BIPs
-    # score 0 is intentionally thin -- reflects genuine rarity of non-engagement
-    # allow reuse for score 0 rather than crashing
+    # anchor pool after 50-token filter, score mapping, and gold
+    # exclusion: score 0: 31  score 2: 374  score 4: 8,500
     seed: int = 42
 
 
-# ── Judges / Reward Models ──────────────────────────────────────────
+# ── Reward models ────────────────────────────────────────────────────
 
 @dataclass
 class AuthenticityJudgeConfig:
@@ -59,8 +56,6 @@ class AuthenticityJudgeConfig:
 class RubricJudgeConfig:
     model_name: str = "google/gemma-4-E4B-it"
     rubric_path: str = "docs/rubric.tsv"
-    # valid scores are 0, 2, 4
-    # reject if judge score differs from intended score by more than one level
     max_score_deviation: int = 1
     log_dir: str = "logs/judges"
 
@@ -70,9 +65,7 @@ class JudgeConfig:
     authenticity: AuthenticityJudgeConfig = field(
         default_factory=AuthenticityJudgeConfig
     )
-    rubric: RubricJudgeConfig = field(
-        default_factory=RubricJudgeConfig
-    )
+    rubric: RubricJudgeConfig = field(default_factory=RubricJudgeConfig)
     spot_check_n: int = 100
 
 
@@ -81,9 +74,8 @@ class JudgeConfig:
 @dataclass
 class LoRAConfig:
     """
-    LoRA config for Qwen models (BIPDomainSFT, assessor).
-    Qwen's architecture has plain leaf-name Linear layers, so simple
-    exact-match target_modules works fine.
+    LoRA config for Qwen models. Qwen exposes plain leaf-name Linear
+    layers, so exact-match target_modules works.
     """
     r: int = 16
     lora_alpha: int = 32
@@ -97,13 +89,11 @@ class LoRAConfig:
 @dataclass
 class LoRAConfigGemma4:
     """
-    LoRA config for Gemma 4 models (generator, rubric judge if ever
-    fine-tuned). Gemma 4 is multimodal by architecture -- its vision
-    and audio towers wrap attention projections in a custom Linear
-    subclass that also matches simple leaf names like "q_proj". Using
-    exact-match target_modules risks PEFT silently adapting the wrong
-    layers or aborting adapter injection. This regex restricts LoRA
-    to the text tower's plain nn.Linear projections only.
+    LoRA config for Gemma 4. Gemma 4 is multimodal by architecture --
+    its vision and audio towers wrap attention projections in Linear
+    subclasses that also match leaf names like "q_proj". Exact-match
+    target_modules risks PEFT adapting the wrong layers or aborting
+    adapter injection, so this regex restricts LoRA to the text tower.
     """
     r: int = 16
     lora_alpha: int = 32
@@ -124,7 +114,7 @@ class BIPDomainSFTConfig:
     gradient_accumulation_steps: int = 8
     learning_rate: float = 2e-4
     warmup_ratio: float = 0.05
-    # from EDA: p99=1297 tokens + 256 buffer, capped at 4096
+    # from EDA: p99 = 1297 tokens plus buffer
     max_seq_length: int = 1553
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     fp16: bool = False
@@ -136,8 +126,8 @@ class BIPDomainSFTConfig:
 @dataclass
 class GeneratorSFTConfig:
     """
-    Stage 4: SFT warmup for the Gemma 4 E4B generator before PPO.
-    No score conditioning at this stage -- see project scope.
+    SFT warmup for the Gemma 4 E4B generator. No score conditioning at
+    this stage; score enters only through reward-based selection.
     """
     model_name: str = "google/gemma-4-E4B-it"
     output_dir: str = "models/GeneratorSFT"
@@ -155,18 +145,14 @@ class GeneratorSFTConfig:
 
 @dataclass
 class PPOConfig:
-    """
-    Stage 5: PPO training config for the generator.
-    alpha and beta are tuned via pilot runs before the full run.
-    """
     model_name: str = "google/gemma-4-E4B-it"
     sft_checkpoint: str = "models/GeneratorSFT"
     output_dir: str = "models/PPOGenerator"
-    alpha: float = 0.5          # weight on authenticity reward
-    beta: float = 0.1           # weight on KL penalty
-    batch_size: int = 8
-    mini_batch_size: int = 2
-    ppo_epochs: int = 4
+    alpha: float = 0.5
+    beta: float = 0.1
+    batch_size: int = 2
+    mini_batch_size: int = 1
+    ppo_epochs: int = 2
     learning_rate: float = 1.41e-5
     max_steps: int = 5000
     save_every: int = 500
@@ -180,23 +166,26 @@ class AssessorConfig:
     model_name: str = "Qwen/Qwen2.5-7B"
     output_dir: str = "models/assessor"
     training_condition: str = "synthetic_only"
-    # 3 classes matching rubric anchors: 0, 2, 4
+    # 3 classes matching the rubric anchors 0, 2, 4
     num_labels: int = 3
-    label_map: dict = field(
-        default_factory=lambda: {0: 0, 2: 1, 4: 2}
-    )
-    # element is a required input feature -- assessor is element-aware
+    label_map: dict = field(default_factory=lambda: {0: 0, 2: 1, 4: 2})
     use_element_prefix: bool = True
-    num_train_epochs: int = 5
-    per_device_train_batch_size: int = 8
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-4
+    num_train_epochs: int = 3
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 16
+    # 2e-5, down from 1e-4. At the higher rate with a default-init
+    # score head, gradient norms reached ~3700 against max_grad_norm=1.0
+    # and every update was clipped, collapsing predictions to the
+    # extreme classes. The head init is the primary fix (see
+    # setup_assessor); this is the accompanying stability margin.
+    learning_rate: float = 2e-5
     warmup_ratio: float = 0.05
-    max_seq_length: int = 1553
+    max_seq_length: int = 1024
     ordinal_loss: bool = True
     lora: LoRAConfig = field(default_factory=LoRAConfig)
-    fp16: bool = True
-    log_dir: str = "logs/training"
+    fp16: bool = False
+    bf16: bool = True
+    log_dir: str = "logs/assessor"
     seed: int = 42
 
 
@@ -223,18 +212,16 @@ class AuditConfig:
     results_dir: str = "results/audit"
     log_dir: str = "logs/audit"
     high_confidence_entropy_threshold: float = 0.5
-    # confirmed viable from EDA: 62 districts with >= 30 scored BIPs
-    # rurality gap confirmed: 37-point difference between urban and rural
-    # temporal trend confirmed: score inflation from 2021-2022 onward
+    # from EDA: 62 districts with >= 30 scored BIPs; 37-point rurality
+    # gap in score-4 rate; score inflation from 2021-2022 onward
     subgroup_columns: list[str] = field(
         default_factory=lambda: ["DistrictID", "Rurality", "SchoolYear"]
     )
     run_subgroup_analysis: bool = True
-    # prob4_ElementX is a pre-existing model score signal -- use as audit baseline
     existing_model_score_column: str = "prob4_ElementX"
 
 
-# ── Top-level pipeline config ─────────────────────────────────────────
+# ── Top level ────────────────────────────────────────────────────────
 
 @dataclass
 class PipelineConfig:

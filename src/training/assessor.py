@@ -36,10 +36,10 @@ def build_assessor_dataset(
     """
     Tokenizes BIP text for score classification.
 
-    The element label is prefixed to the text because the same response
-    can warrant different scores under different elements -- Element 5
-    requires cited research where Element 6 requires monitoring
-    evidence. An element-blind assessor cannot represent that.
+    The element label is prefixed because the same response can warrant
+    different scores under different elements -- Element 5 requires
+    cited research where Element 6 requires monitoring evidence. An
+    element-blind assessor cannot represent that.
     """
     prefixed = [f"{e}: {t}" for e, t in zip(elements, texts)]
     labels = [LABEL_MAP[int(s)] for s in scores]
@@ -71,19 +71,19 @@ def load_condition_data(
     """
     Assembles training data for one experimental condition.
 
-    A -- synthetic_only: PPO/BoN generated text with target scores.
-         Labels come from the rubric via reward selection, never from
-         supervisor judgement.
+    A -- synthetic_only: generated text with target scores. Labels come
+         from the rubric via reward selection, never from supervisor
+         judgement.
 
     B -- real_noisy: real BIPs with supervisor scores at their natural
          distribution (95% score 4). The lower bound that motivates
          the project.
 
     C -- balanced_real: real BIPs downsampled to match the synthetic
-         score distribution. This is the control that separates two
-         explanations for any gain in condition A. If A beats B only
-         because synthetic data is score-balanced, C will match A. If
-         A beats C as well, the gain comes from label quality.
+         score distribution. The control separating two explanations
+         for any gain in A. If A beats B only because synthetic data is
+         score-balanced, C will match A. If A beats C too, the gain
+         comes from label quality.
 
     D -- hybrid: both pools combined.
     """
@@ -105,9 +105,9 @@ def load_condition_data(
                 pool = df[df["score"] == score]
                 if len(pool) == 0:
                     continue
-                # score 0 has 31 real anchors total, far fewer than the
-                # synthetic pool's count, so sampling with replacement
-                # is required to hit the target distribution
+                # score 0 has 31 real anchors total, fewer than the
+                # synthetic pool's count, so replacement is required to
+                # hit the target distribution
                 take = pool.sample(
                     n=min(n, len(pool)) if len(pool) >= n else n,
                     replace=len(pool) < n,
@@ -144,21 +144,31 @@ def setup_assessor(
     config: AssessorConfig,
     class_weights: torch.Tensor | None = None,
     domain_checkpoint: str | None = "models/BIPDomainSFT",
+    score_head_std: float = 1e-3,
 ):
     """
     Builds the classification model.
 
     The BIPDomainSFT adapter was trained with a causal LM head and
-    cannot be attached directly to a sequence classification model.
-    To carry the domain knowledge across, the adapter is merged into
-    the base weights, saved, and reloaded as a classifier -- the
-    transformer trunk is shared between Qwen2ForCausalLM and
+    cannot attach directly to a sequence classification model. To carry
+    the domain knowledge across, the adapter is merged into the base
+    weights, saved, and reloaded as a classifier -- the transformer
+    trunk is shared between Qwen2ForCausalLM and
     Qwen2ForSequenceClassification, so the merged weights transfer and
     only the score head is randomly initialised.
 
-    Pass domain_checkpoint=None to start from stock Qwen instead. That
-    is the cleaner ablation for asking what the domain fine-tune
-    contributed to the assessor specifically.
+    Pass domain_checkpoint=None to start from stock Qwen instead, which
+    is the cleaner ablation for what the domain fine-tune contributed.
+
+    score_head_std: the head is re-initialised at 1e-3 rather than the
+    HuggingFace default of 0.02. Measured at the default, the merged
+    Qwen's final hidden states produced logits spanning -12.9 to 26.0
+    (std 8.4) before any training. Cross entropy started at 6.16
+    instead of the ~1.10 expected for three classes, gradient norms hit
+    3700 against max_grad_norm=1.0, and every update was clipped to a
+    direction dominated by noise. The result was a model that predicted
+    only the extreme classes: recall on score 2 was 0.089 across 90
+    examples, and QWK came out at -0.038.
     """
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
@@ -193,6 +203,12 @@ def setup_assessor(
     )
     model.config.pad_token_id = tokenizer.pad_token_id
 
+    with torch.no_grad():
+        model.score.weight.normal_(mean=0.0, std=score_head_std)
+        if getattr(model.score, "bias", None) is not None:
+            model.score.bias.zero_()
+    print(f"Score head re-initialised at std={score_head_std}")
+
     lora = LoraConfig(
         task_type=TaskType.SEQ_CLS,
         r=config.lora.r,
@@ -208,11 +224,19 @@ def setup_assessor(
 
 
 class OrdinalTrainer(Trainer):
-    """Trainer that swaps in the ordinal loss."""
+    """
+    Trainer that swaps in the ordinal loss, and logs logit magnitude on
+    the first step.
+
+    The magnitude check exists because a scale problem in the
+    classification head is invisible in the loss curve alone -- it just
+    looks like a large starting loss -- but is obvious from the logits.
+    """
 
     def __init__(self, *args, ordinal_loss=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.ordinal_loss = ordinal_loss
+        self._logged_init = False
 
     def compute_loss(
         self, model, inputs, return_outputs=False, **kwargs
@@ -220,6 +244,14 @@ class OrdinalTrainer(Trainer):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
+
+        if not self._logged_init:
+            with torch.no_grad():
+                l = logits.float()
+                print(f"[init check] logits min={l.min():.2f} "
+                      f"max={l.max():.2f} std={l.std():.2f}  "
+                      f"(expect roughly |logit| < 3 at start)")
+            self._logged_init = True
 
         if self.ordinal_loss is not None:
             loss = self.ordinal_loss(logits, labels)
@@ -252,12 +284,14 @@ def train_assessor(
         )
         print(f"Ordinal loss active, class weights: "
               f"{class_weights.tolist() if class_weights is not None else None}")
+    else:
+        print("Plain cross entropy (ordinal loss disabled)")
 
     eff = config.per_device_train_batch_size * config.gradient_accumulation_steps
     steps_per_epoch = max(1, len(dataset) // eff)
     total = steps_per_epoch * config.num_train_epochs
     warmup = int(total * config.warmup_ratio)
-    print(f"Total steps: {total}, warmup: {warmup}")
+    print(f"Total steps: {total}, warmup: {warmup}, lr: {config.learning_rate}")
 
     args = TrainingArguments(
         output_dir=config.output_dir,
@@ -269,7 +303,7 @@ def train_assessor(
         max_grad_norm=1.0,
         bf16=True,
         fp16=False,
-        logging_steps=25,
+        logging_steps=10,
         save_strategy="epoch",
         save_total_limit=1,
         report_to="wandb",
