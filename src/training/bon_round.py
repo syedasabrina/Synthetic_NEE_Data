@@ -10,6 +10,13 @@ import pandas as pd
 import torch
 from datasets import Dataset
 
+# add to the existing import block at the top of the file
+from peft import PeftModel
+from transformers import (
+    Gemma4ForConditionalGeneration, AutoTokenizer,
+    Trainer, TrainingArguments, default_data_collator,
+)
+
 from src.rewards.authenticity_reward import AuthenticityReward
 from src.rewards.rubric_reward import RubricReward
 from src.generation.sampler import (
@@ -343,3 +350,80 @@ def build_retrain_dataset(
         remove_columns=["prompt", "completion"],
         load_from_cache_file=False,
     )
+
+
+
+# append at the end of the file, after build_retrain_dataset
+
+def retrain_generator(
+    accepted_df: pd.DataFrame,
+    base_model_name: str,
+    prev_adapter_path: str,
+    output_dir: str,
+    num_train_epochs: int = 3,
+    per_device_train_batch_size: int = 4,
+    gradient_accumulation_steps: int = 8,
+    learning_rate: float = 2e-4,
+    warmup_ratio: float = 0.05,
+    max_seq_length: int = 1024,
+    seed: int = 42,
+) -> None:
+    """
+    Continues LoRA training on the previous round's adapter, using
+    this round's accepted candidates. Unlike GeneratorSFT's initial
+    warmup, which starts LoRA from scratch, each BoN round must
+    continue from the adapter the previous round produced -- otherwise
+    every round restarts from the SFT baseline and "best-of-n improves
+    the generator" would not hold. PeftModel.from_pretrained reads the
+    adapter's own saved LoRA config, so no fresh LoraConfig is needed
+    here.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(prev_adapter_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base = Gemma4ForConditionalGeneration.from_pretrained(
+        base_model_name, dtype=torch.bfloat16, device_map="auto",
+    )
+    model = PeftModel.from_pretrained(base, prev_adapter_path, is_trainable=True)
+    model.print_trainable_parameters()
+
+    dataset = build_retrain_dataset(accepted_df, tokenizer, max_length=max_seq_length)
+
+    effective_batch = per_device_train_batch_size * gradient_accumulation_steps
+    steps_per_epoch = max(1, len(dataset) // effective_batch)
+    total_steps = steps_per_epoch * num_train_epochs
+    warmup_steps = int(total_steps * warmup_ratio)
+    print(f"Retrain total steps: {total_steps}, warmup: {warmup_steps}")
+
+    args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        warmup_steps=warmup_steps,
+        max_grad_norm=1.0,
+        bf16=True,
+        fp16=False,
+        logging_steps=10,
+        save_strategy="epoch",
+        save_total_limit=1,
+        report_to="wandb",
+        run_name=f"BoNRetrain-{Path(output_dir).name}",
+        seed=seed,
+        dataloader_num_workers=2,
+        remove_unused_columns=False,
+    )
+
+    trainer = Trainer(
+        model=model, args=args, train_dataset=dataset,
+        data_collator=default_data_collator,
+    )
+    trainer.train()
+
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Retrained generator saved to {output_dir}")

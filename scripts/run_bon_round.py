@@ -4,7 +4,8 @@ Runs one round of best-of-n rejection-sampling fine-tuning.
 
 Each round: sample N candidates per prompt from the current generator,
 score with both reward models, keep the top k, retrain the generator on
-the accepted set.
+the accepted set, continuing from the adapter passed via --generator
+rather than reinitializing LoRA from the base model.
 
 Round 1 starts from the SFT warmup checkpoint; each later round starts
 from the previous round's output.
@@ -15,12 +16,13 @@ retrain step, losing nothing but wasting a queue slot. --retrain_only
 picks up from accepted.jsonl so that work is never repeated.
 
 Usage:
-    python scripts/run_bon_round.py --round 1 \
-        --generator models/GeneratorSFT \
-        --output models/BoN_round1 --n_prompts 500
+    python scripts/run_bon_round.py --round 2 \
+        --generator models/BoN_round1 \
+        --output models/BoN_round2 --n_prompts 500
 
-    python scripts/run_bon_round.py --round 1 \
-        --output models/BoN_round1 --retrain_only
+    python scripts/run_bon_round.py --round 2 \
+        --generator models/BoN_round1 \
+        --output models/BoN_round2 --retrain_only
 """
 
 import argparse
@@ -34,19 +36,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoTokenizer
 
 from src.data.corpus import load, for_anchor_pool, load_gold
-from src.training.bon_round import BestOfNRound, build_retrain_dataset
-from src.training.generator_sft import train as train_generator
+from src.training.bon_round import BestOfNRound, retrain_generator
 from src.utils.config import GeneratorSFTConfig
 
 
 parser = argparse.ArgumentParser(description="One best-of-n round")
 parser.add_argument("--data", default="data/raw/bips.csv")
 parser.add_argument("--round", type=int, required=True)
-parser.add_argument("--generator", default=None,
-                    help="Adapter to sample from; not needed with --retrain_only")
+parser.add_argument("--generator", required=True,
+                    help="Adapter to sample from, and to continue training from at retrain time")
 parser.add_argument("--output", required=True)
 parser.add_argument("--n_prompts", type=int, default=500)
 parser.add_argument("--n_candidates", type=int, default=8)
@@ -64,8 +64,8 @@ args = parser.parse_args()
 print("=" * 70)
 print(f"BEST-OF-N ROUND {args.round}")
 print(f"  output:       {args.output}")
+print(f"  generator:    {args.generator}")
 if not args.retrain_only:
-    print(f"  generator:    {args.generator}")
     print(f"  n_prompts:    {args.n_prompts}")
     print(f"  n_candidates: {args.n_candidates}")
     print(f"  keep_top_k:   {args.keep_top_k}")
@@ -85,10 +85,6 @@ if args.retrain_only:
     accepted = pd.read_json(path, lines=True)
     print(f"Loaded {len(accepted)} accepted candidates from {path}")
 else:
-    if not args.generator:
-        print("--generator is required unless --retrain_only is set")
-        sys.exit(1)
-
     df = load(args.data)
     anchor_df = for_anchor_pool(df)
     gold_df = load_gold()
@@ -131,6 +127,7 @@ else:
 
 print("\n" + "=" * 70)
 print("RETRAINING GENERATOR ON ACCEPTED SET")
+print(f"  continuing from: {args.generator}")
 print("=" * 70)
 
 config = GeneratorSFTConfig(
@@ -140,16 +137,19 @@ config = GeneratorSFTConfig(
     gradient_accumulation_steps=16,
 )
 
-tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-dataset = build_retrain_dataset(
-    accepted, tokenizer, max_length=config.max_seq_length
+retrain_generator(
+    accepted_df=accepted,
+    base_model_name=config.model_name,
+    prev_adapter_path=args.generator,
+    output_dir=config.output_dir,
+    num_train_epochs=config.num_train_epochs,
+    per_device_train_batch_size=config.per_device_train_batch_size,
+    gradient_accumulation_steps=config.gradient_accumulation_steps,
+    learning_rate=config.learning_rate,
+    warmup_ratio=config.warmup_ratio,
+    max_seq_length=config.max_seq_length,
+    seed=42 + args.round,
 )
-print(f"Retrain dataset: {len(dataset)} examples")
-
-train_generator(config, dataset, tokenizer=tokenizer)
 
 total = time.time() - start
 print(f"\nRound {args.round} complete in {total/60:.1f} min")

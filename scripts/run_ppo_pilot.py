@@ -24,6 +24,11 @@ from src.data.corpus import load, for_anchor_pool, load_gold
 from src.training.ppo_trainer import CustomPPO, check_divergence
 from src.generation.sampler import sample_prompt_spec
 
+import torch  # add to the top
+
+# alongside each ppo.policy.save_pretrained(...) call, both the periodic
+# checkpoint and the final save:
+torch.save(ppo.value_head.state_dict(), f"{out}/value_head.pt")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", default="data/raw/bips.csv")

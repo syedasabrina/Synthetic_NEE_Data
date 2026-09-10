@@ -41,7 +41,6 @@ secrets.py
 *.key
 .env*
 !.env.example
-scripts/train.slurm
+*.slurm
 models/BIPDomainSFT/adapter_model.safetensors
 models/BIPDomainSFT/checkpoint-*
-scripts/train.slurm

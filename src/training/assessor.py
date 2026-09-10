@@ -237,6 +237,13 @@ class OrdinalTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.ordinal_loss = ordinal_loss
         self._logged_init = False
+        # compute_loss does plain mean-reduction and ignores
+        # num_items_in_batch. Without this, Trainer silently skips
+        # dividing by gradient_accumulation_steps (assuming compute_loss
+        # already normalized), inflating loss and gradients by exactly
+        # that factor -- this is what produced loss=16 / grad_norm=700
+        # against gradient_accumulation_steps=16.
+        self.model_accepts_loss_kwargs = False
 
     def compute_loss(
         self, model, inputs, return_outputs=False, **kwargs
