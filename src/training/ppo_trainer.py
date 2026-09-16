@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
-from peft import PeftModel
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from src.rewards.authenticity_reward import AuthenticityReward
 from src.rewards.rubric_reward import RubricReward
@@ -18,6 +18,7 @@ from src.generation.sampler import (
     build_generation_prompt,
     sample_prompt_spec,
 )
+from src.utils.config import LoRAConfigGemma4
 
 
 class ValueHead(nn.Module):
@@ -121,12 +122,32 @@ class CustomPPO:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        merged_path = f"models/_merged_ppo_{Path(sft_checkpoint).name}"
+        if not Path(merged_path).exists():
+            print(f"Merging {sft_checkpoint} into base weights for a "
+                  f"correct PPO KL reference...")
+            base_for_merge = Gemma4ForConditionalGeneration.from_pretrained(
+                base_model_name, dtype=torch.bfloat16, device_map="cpu",
+            )
+            merged = PeftModel.from_pretrained(
+                base_for_merge, sft_checkpoint
+            ).merge_and_unload()
+            merged.save_pretrained(merged_path)
+            self.tokenizer.save_pretrained(merged_path)
+            del base_for_merge, merged
+            torch.cuda.empty_cache()
+
         base = Gemma4ForConditionalGeneration.from_pretrained(
-            base_model_name, dtype=torch.bfloat16, device_map=policy_device,
+            merged_path, dtype=torch.bfloat16, device_map=policy_device,
         )
-        self.policy = PeftModel.from_pretrained(
-            base, sft_checkpoint, is_trainable=True
+        lora_cfg = LoRAConfigGemma4()
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_cfg.r, lora_alpha=lora_cfg.lora_alpha,
+            target_modules=lora_cfg.target_modules,
+            lora_dropout=lora_cfg.lora_dropout, bias=lora_cfg.bias,
         )
+        self.policy = get_peft_model(base, lora_config)
 
         if gradient_checkpointing:
             self.policy.gradient_checkpointing_enable()

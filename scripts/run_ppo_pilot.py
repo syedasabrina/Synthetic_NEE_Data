@@ -19,16 +19,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import torch
 
 from src.data.corpus import load, for_anchor_pool, load_gold
 from src.training.ppo_trainer import CustomPPO, check_divergence
 from src.generation.sampler import sample_prompt_spec
 
-import torch  # add to the top
-
-# alongside each ppo.policy.save_pretrained(...) call, both the periodic
-# checkpoint and the final save:
-torch.save(ppo.value_head.state_dict(), f"{out}/value_head.pt")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", default="data/raw/bips.csv")
@@ -102,6 +98,7 @@ for step in range(args.steps):
 
     if step % args.save_every == 0 and step > 0:
         ppo.policy.save_pretrained(f"{out}/checkpoint-{step}")
+        torch.save(ppo.value_head.state_dict(), f"{out}/checkpoint-{step}/value_head.pt")
         with open(f"{out}/history.json", "w") as f:
             json.dump(history, f, indent=2)
 
@@ -109,6 +106,7 @@ elapsed = time.time() - start
 
 ppo.policy.save_pretrained(out)
 ppo.tokenizer.save_pretrained(out)
+torch.save(ppo.value_head.state_dict(), f"{out}/value_head.pt")
 with open(f"{out}/history.json", "w") as f:
     json.dump(history, f, indent=2)
 
