@@ -173,12 +173,10 @@ class AssessorConfig:
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 16
-    # 2e-5, down from 1e-4. At the higher rate with a default-init
-    # score head, gradient norms reached ~3700 against max_grad_norm=1.0
-    # and every update was clipped, collapsing predictions to the
-    # extreme classes. The head init is the primary fix (see
-    # setup_assessor); this is the accompanying stability margin.
-    learning_rate: float = 2e-5
+    # 1e-4. Lowered to 2e-5 while a gradient-accumulation bug inflated
+    # loss and gradients 16x. With that fixed, 2e-5 plateaued at the
+    # label-prior entropy (~0.95) on BoN round 3.
+    learning_rate: float = 1e-4
     warmup_ratio: float = 0.05
     max_seq_length: int = 1024
     ordinal_loss: bool = True
