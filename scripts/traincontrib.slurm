@@ -30,7 +30,6 @@ export LOGS_DIR=$PROJECT_DIR/logs
 export HF_HOME=/scratch/sakter6/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
-export WANDB_API_KEY=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
 export WANDB_PROJECT=synthetic-nee-bip
 export WANDB_DIR=$LOGS_DIR/wandb
 export PYTHONPATH=$PROJECT_DIR:$PYTHONPATH
