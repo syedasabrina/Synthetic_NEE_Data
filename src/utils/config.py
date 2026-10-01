@@ -55,7 +55,8 @@ class AuthenticityJudgeConfig:
 @dataclass
 class RubricJudgeConfig:
     model_name: str = "google/gemma-4-E4B-it"
-    rubric_path: str = "docs/rubric.tsv"
+    # not read by any code; RubricReward.RUBRIC is the operational rubric
+    rubric_path: str = "rubric.tsv"
     max_score_deviation: int = 1
     log_dir: str = "logs/judges"
 
@@ -127,7 +128,7 @@ class BIPDomainSFTConfig:
 class GeneratorSFTConfig:
     """
     SFT warmup for the Gemma 4 E4B generator. No score conditioning at
-    this stage; score enters only through reward-based selection.
+    this stage; score enters only through selection.
     """
     model_name: str = "google/gemma-4-E4B-it"
     output_dir: str = "models/GeneratorSFT"
@@ -136,28 +137,14 @@ class GeneratorSFTConfig:
     gradient_accumulation_steps: int = 8
     learning_rate: float = 2e-4
     warmup_ratio: float = 0.05
-    max_seq_length: int = 1024
+    # prompt (<= max_prompt_tokens) plus completion plus EOS must fit.
+    # Was 1024 with an uncapped anchor. Raising it adds activation memory;
+    # if SFT runs out of memory, lower --batch_size before lowering this.
+    max_seq_length: int = 1280
+    max_prompt_tokens: int = 640
     lora: LoRAConfigGemma4 = field(default_factory=LoRAConfigGemma4)
     bf16: bool = True
     log_dir: str = "logs/GeneratorSFT"
-    seed: int = 42
-
-
-@dataclass
-class PPOConfig:
-    model_name: str = "google/gemma-4-E4B-it"
-    sft_checkpoint: str = "models/GeneratorSFT"
-    output_dir: str = "models/PPOGenerator"
-    alpha: float = 0.5
-    beta: float = 0.1
-    batch_size: int = 2
-    mini_batch_size: int = 1
-    ppo_epochs: int = 2
-    learning_rate: float = 1.41e-5
-    max_steps: int = 5000
-    save_every: int = 500
-    lora: LoRAConfigGemma4 = field(default_factory=LoRAConfigGemma4)
-    log_dir: str = "logs/PPO"
     seed: int = 42
 
 
@@ -228,7 +215,6 @@ class PipelineConfig:
     judges: JudgeConfig = field(default_factory=JudgeConfig)
     bip_domain_sft: BIPDomainSFTConfig = field(default_factory=BIPDomainSFTConfig)
     generator_sft: GeneratorSFTConfig = field(default_factory=GeneratorSFTConfig)
-    ppo: PPOConfig = field(default_factory=PPOConfig)
     assessor: AssessorConfig = field(default_factory=AssessorConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)

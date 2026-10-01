@@ -105,8 +105,10 @@ def load(
     # filter: must have text above min length
     df = df[df["token_count"] >= min_tokens].copy()
 
-    # deduplicate by text only -- the same text scored under different
-    # elements is informative and both rows are kept
+    # deduplicate by text only. A text that appears under two elements
+    # keeps only its first row. (The previous comment said both rows were
+    # kept, which is not what drop_duplicates does.) Counts quoted in the
+    # project notes (11,953 usable) come from this behaviour.
     if deduplicate:
         df = df.drop_duplicates(subset=[text_col]).copy()
 

@@ -1,27 +1,21 @@
 from __future__ import annotations
 
-import torch
 import numpy as np
-from pathlib import Path
-
-from transformers import Gemma4ForConditionalGeneration, AutoTokenizer
+import torch
 from peft import PeftModel
+from transformers import AutoTokenizer, Gemma4ForConditionalGeneration
 
 
 # What each element actually asks the principal to describe.
 #
 # Elements 1, 2, and 7 are taken verbatim from the NEE BIP Process
 # Organizer form. Elements 3 through 6 are derived from the rubric
-# criteria, since the corresponding form pages were not available --
-# they state the same requirement the rubric scores against, but are
-# not the official prompt wording.
+# criteria, since the corresponding form pages were not available. They
+# state the same requirement the rubric scores against, but are not the
+# official prompt wording.
 #
-# Added because a keyword audit of round 2 found only 63% of
-# completions addressed their assigned element, with Element 3 at 39%.
-# The prompt previously supplied only "Element3" plus a rubric line
-# describing how WELL to do something, never stating WHAT to do, so
-# the anchor BIP became the strongest signal and the model drifted
-# toward whatever topic the anchor happened to cover.
+# Added because a keyword audit of round 2 found only 63% of completions
+# addressed their assigned element, with Element 3 at 39%.
 ELEMENT_QUESTIONS = {
     "Element1":
         "Describe your leadership involvement in the development of "
@@ -62,26 +56,10 @@ ELEMENT_QUESTIONS = {
 }
 
 
-def build_generation_prompt(
-    element: str,
-    target_score: int,
-    rubric_text: str,
-    anchor_text: str,
-) -> str:
-    """
-    Generation prompt. Unlike the SFT warmup, this includes the target
-    score explicitly. Score conditioning is introduced here and
-    reinforced through reward-based selection, never through
-    supervised labels on noisy supervisor scores.
-
-    The element question is stated before the anchor so the task is
-    defined before the model sees an example that may cover different
-    ground, and the anchor is explicitly framed as a style reference
-    rather than a content template.
-    """
-    question = ELEMENT_QUESTIONS.get(element, "")
-
-    return f"""You are a school principal writing a Building Improvement Plan.
+# Same wording as the prompt used in rounds 1 to 4, so changes in output
+# can be attributed to the decoder, EOS and gating fixes and not to the
+# prompt.
+_GEN_TEMPLATE = """You are a school principal writing a Building Improvement Plan.
 
 {element} asks: {question}
 
@@ -99,13 +77,91 @@ for a score of {target_score}. Write in your own words:
 """
 
 
+def _render(element, target_score, rubric_text, anchor_text) -> str:
+    return _GEN_TEMPLATE.format(
+        element=element,
+        question=ELEMENT_QUESTIONS.get(element, ""),
+        target_score=target_score,
+        rubric_text=rubric_text,
+        anchor_text=anchor_text,
+    )
+
+
+def _n_tokens(tokenizer, text: str) -> int:
+    return len(tokenizer(text, add_special_tokens=True)["input_ids"])
+
+
+def fit_anchor(tokenizer, anchor_text: str, budget: int) -> str:
+    """Cuts the anchor to at most `budget` tokens, at a word boundary."""
+    ids = tokenizer(anchor_text, add_special_tokens=False)["input_ids"]
+    if len(ids) <= budget:
+        return anchor_text
+    cut = tokenizer.decode(ids[:max(budget, 0)], skip_special_tokens=True)
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip() + " ..."
+
+
+def build_generation_prompt(
+    element: str,
+    target_score: int,
+    rubric_text: str,
+    anchor_text: str,
+    tokenizer=None,
+    max_prompt_tokens: int = 640,
+) -> str:
+    """
+    Generation prompt. Score conditioning enters here and is reinforced
+    through selection, never through supervised labels on supervisor scores.
+
+    With a tokenizer, the anchor is cut so the whole prompt fits in
+    max_prompt_tokens. Before this, about 5% of prompts exceeded the
+    sampler's 1,024-token limit and right-truncation removed the final
+    instruction line. The default of 640 leaves room for a completion of
+    roughly 600 tokens inside a 1,280-token training sequence.
+    """
+    prompt = _render(element, target_score, rubric_text, anchor_text)
+    if tokenizer is None or _n_tokens(tokenizer, prompt) <= max_prompt_tokens:
+        return prompt
+
+    overhead = _n_tokens(tokenizer, _render(element, target_score, rubric_text, ""))
+    budget = max_prompt_tokens - overhead - 4
+    if budget < 32:
+        raise ValueError(
+            f"Prompt overhead is {overhead} tokens; max_prompt_tokens="
+            f"{max_prompt_tokens} leaves no room for an anchor."
+        )
+
+    # decode/encode round trips can shift the count by a few tokens, so
+    # shrink until it fits
+    for _ in range(6):
+        anchor = fit_anchor(tokenizer, anchor_text, budget)
+        prompt = _render(element, target_score, rubric_text, anchor)
+        n = _n_tokens(tokenizer, prompt)
+        if n <= max_prompt_tokens:
+            return prompt
+        budget -= (n - max_prompt_tokens) + 4
+    raise ValueError(f"Could not fit prompt into {max_prompt_tokens} tokens.")
+
+
 class CandidateSampler:
     """
     Samples N candidate BIPs per prompt from the current generator.
 
-    The generation half of best-of-n: produce many candidates, let the
-    reward models rank them, keep the best. The generator loads from a
-    LoRA checkpoint that advances each round.
+    Defaults changed from rounds 1 to 4:
+
+    repetition_penalty 1.0 and no_repeat_ngram_size 0 (both off). HF
+    applies both over the prompt as well as the completion, and the prompt
+    holds the rubric, the element question and a real BIP, so the decoder
+    was banned from reusing ordinary words and 4-grams that appear in its
+    own instructions. Looping is now handled by learned EOS plus the
+    quality gate. The decoding probe (scripts/probe_decoding.py) is what
+    decides whether any penalty is worth restoring.
+
+    max_new_tokens 512 (was 400). corpus token_count is whitespace words,
+    so the real p90 of 469 is words, about 600 model tokens. A 400-token
+    cap clipped a large share of real-length completions. With EOS learned
+    most completions end well before the cap.
     """
 
     def __init__(
@@ -113,38 +169,20 @@ class CandidateSampler:
         base_model_name: str = "google/gemma-4-E4B-it",
         adapter_path: str = "models/GeneratorSFT",
         device: str = "cuda",
-        max_new_tokens: int = 400,
+        max_new_tokens: int = 512,
         temperature: float = 0.9,
         top_p: float = 0.95,
-        repetition_penalty: float = 1.15,
-        no_repeat_ngram_size: int = 4,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
+        max_input_tokens: int = 1024,
     ):
-        """
-        max_new_tokens 400 sits between two observed failure modes. At
-        320, round 1 completions were all clipped at ~300 words with
-        the maximum pinned across every score level, so the model was
-        trained on systematically truncated text. At 512, round 2
-        produced 358-word completions with a distinct-bigram ratio of
-        0.559 and 74% of accepted candidates below 0.7 -- the model
-        filled the extra budget by looping. Real BIPs have p50 at 150
-        tokens and p90 at 469, so most responses finish before 400.
-
-        repetition_penalty and no_repeat_ngram_size stop looping at the
-        decoder rather than penalizing it afterward. The round 2 worst
-        case repeated one sentence eight times to fill its budget;
-        no_repeat_ngram_size=4 makes that structurally impossible. With
-        these set, accepted-set repetition went from 0.559 to 0.994.
-
-        temperature 0.9 and top_p 0.95 stay high on purpose. Best-of-n
-        depends on candidate diversity; sampling N near-identical
-        completions wastes the budget.
-        """
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.max_input_tokens = max_input_tokens
 
         print(f"Loading generator: {base_model_name} + {adapter_path} "
               f"on {device}")
@@ -159,107 +197,133 @@ class CandidateSampler:
         )
         self.model = PeftModel.from_pretrained(base, adapter_path)
         self.model.eval()
-
         for param in self.model.parameters():
             param.requires_grad = False
 
+        # Stop on the EOS id used in training AND on whatever the model's
+        # generation_config stops on, so a mismatch between the two cannot
+        # silently disable stopping.
+        eos = set()
+        gc = getattr(self.model, "generation_config", None)
+        cfg_eos = getattr(gc, "eos_token_id", None)
+        if isinstance(cfg_eos, int):
+            eos.add(cfg_eos)
+        elif cfg_eos:
+            eos.update(int(x) for x in cfg_eos)
+        if self.tokenizer.eos_token_id is not None:
+            eos.add(int(self.tokenizer.eos_token_id))
+        self.eos_ids = sorted(eos)
+        self.pad_id = (self.tokenizer.pad_token_id
+                       if self.tokenizer.pad_token_id is not None
+                       else self.tokenizer.eos_token_id)
+
         print(f"CandidateSampler ready (max_new_tokens={max_new_tokens}, "
-              f"no_repeat_ngram={no_repeat_ngram_size}).")
+              f"rep_penalty={repetition_penalty}, "
+              f"no_repeat_ngram={no_repeat_ngram_size}, "
+              f"stop ids={self.eos_ids}).")
 
     @torch.no_grad()
-    def sample(
+    def sample_detailed(
         self,
         prompt: str,
         n: int = 8,
         batch_size: int = 4,
-    ) -> list[str]:
+    ) -> list[dict]:
         """
-        Returns n candidate completions for a single prompt, generated
-        in sub-batches via num_return_sequences so a large n does not
-        blow up memory on long prompts.
+        Returns n dicts {text, n_tokens, stopped}. `stopped` is True when
+        the model emitted a stop token before max_new_tokens, which is the
+        truncation test the quality gate uses.
         """
         inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=1024,
-        ).to(self.device)
-
+            prompt, return_tensors="pt", truncation=False,
+        )
         prompt_len = inputs["input_ids"].shape[1]
-        candidates = []
+        if prompt_len > self.max_input_tokens:
+            raise ValueError(
+                f"Prompt is {prompt_len} tokens (limit "
+                f"{self.max_input_tokens}). Build it with "
+                f"build_generation_prompt(..., tokenizer=...)."
+            )
+        inputs = inputs.to(self.device)
 
+        out = []
         remaining = n
         while remaining > 0:
             k = min(batch_size, remaining)
-            outputs = self.model.generate(
-                **inputs,
+            gen_kwargs = dict(
                 max_new_tokens=self.max_new_tokens,
                 do_sample=True,
                 temperature=self.temperature,
                 top_p=self.top_p,
-                repetition_penalty=self.repetition_penalty,
-                no_repeat_ngram_size=self.no_repeat_ngram_size,
                 num_return_sequences=k,
-                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.eos_ids,
+                pad_token_id=self.pad_id,
             )
+            if self.repetition_penalty != 1.0:
+                gen_kwargs["repetition_penalty"] = self.repetition_penalty
+            if self.no_repeat_ngram_size:
+                gen_kwargs["no_repeat_ngram_size"] = self.no_repeat_ngram_size
+
+            outputs = self.model.generate(**inputs, **gen_kwargs)
             for seq in outputs:
+                gen = seq[prompt_len:].tolist()
+                stopped, length = False, len(gen)
+                for idx, tok in enumerate(gen):
+                    if tok in self.eos_ids:
+                        stopped, length = True, idx
+                        break
                 text = self.tokenizer.decode(
-                    seq[prompt_len:], skip_special_tokens=True
+                    gen[:length], skip_special_tokens=True
                 ).strip()
-                candidates.append(text)
+                out.append({"text": text, "n_tokens": length,
+                            "stopped": stopped})
             remaining -= k
+        return out
 
-        return candidates
+    def sample(self, prompt: str, n: int = 8, batch_size: int = 4) -> list[str]:
+        return [s["text"] for s in self.sample_detailed(prompt, n, batch_size)]
 
 
-class ElementCycler:
+def element_for_index(elements: list[str], seed: int, i: int) -> str:
     """
-    Cycles through all seven elements in shuffled order, reshuffling on
-    exhaustion. Prevents element drift when sampling many prompts,
-    which matters because per-element anchor counts are uneven.
+    Deterministic element schedule: prompt i belongs to cycle i // E, and
+    each cycle is a seeded shuffle of all elements. Replaces the stateful
+    ElementCycler so a resumed run produces the same specs for the same
+    prompt indices.
     """
-
-    def __init__(self, elements: list[str], rng: np.random.Generator):
-        self.elements = list(elements)
-        self.rng = rng
-        self.rng.shuffle(self.elements)
-        self.idx = 0
-
-    def next(self) -> str:
-        if self.idx >= len(self.elements):
-            self.rng.shuffle(self.elements)
-            self.idx = 0
-        e = self.elements[self.idx]
-        self.idx += 1
-        return e
+    elements = sorted(elements)
+    e = len(elements)
+    perm = np.random.default_rng([seed, 10_000, i // e]).permutation(e)
+    return elements[int(perm[i % e])]
 
 
 def sample_prompt_spec(
     anchor_df,
     rubric_class,
-    element_cycler,
+    element: str,
     rng: np.random.Generator,
     score_weights: dict[int, float] | None = None,
 ) -> dict:
     """
-    Draws one (element, target_score, anchor) spec.
+    Draws one (element, target_score, anchor) spec for a given element.
 
-    Elements come from a cycler for even coverage. Scores are drawn by
-    weight, oversampling 2 and 4 because score-0 anchors are scarce
-    across every element (31 total, roughly four per element).
+    Scores are drawn by weight. If the (element, score) anchor cell is
+    empty it falls back to a score-4 anchor; `anchor_fallback` records
+    that so it can be analysed later.
     """
     score_weights = score_weights or {0: 0.1, 2: 0.35, 4: 0.55}
     scores = list(score_weights.keys())
     weights = list(score_weights.values())
 
-    element = element_cycler.next()
     target_score = int(rng.choice(scores, p=weights))
 
     pool = anchor_df[
         (anchor_df["Element_numberX"] == element)
         & (anchor_df["score"] == target_score)
     ]
+    fallback = False
     if len(pool) == 0:
+        fallback = True
         pool = anchor_df[
             (anchor_df["Element_numberX"] == element)
             & (anchor_df["score"] == 4)
@@ -273,5 +337,8 @@ def sample_prompt_spec(
         "element": element,
         "target_score": target_score,
         "anchor_text": row["Text"],
+        "anchor_score": int(row["score"]),
+        "anchor_fallback": fallback or int(row["score"]) != target_score,
+        "anchor_person": str(row["PersonId"]) if "PersonId" in row else None,
         "rubric_text": rubric_class.RUBRIC[element][target_score],
     }

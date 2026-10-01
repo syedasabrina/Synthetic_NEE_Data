@@ -44,3 +44,6 @@ secrets.py
 *.slurm
 models/BIPDomainSFT/adapter_model.safetensors
 models/BIPDomainSFT/checkpoint-*
+bon_slim*
+.DS_Store
+*.zip

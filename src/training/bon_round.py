@@ -3,60 +3,290 @@ from __future__ import annotations
 import gc
 import json
 import os
+from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 from datasets import Dataset
-
-# add to the existing import block at the top of the file
 from peft import PeftModel
 from transformers import (
-    Gemma4ForConditionalGeneration, AutoTokenizer,
+    AutoTokenizer, Gemma4ForConditionalGeneration,
     Trainer, TrainingArguments, default_data_collator,
 )
 
-from src.rewards.authenticity_reward import AuthenticityReward
-from src.rewards.rubric_reward import RubricReward
+from src.data.encoding import encode_many
 from src.generation.sampler import (
     CandidateSampler,
-    ElementCycler,
     build_generation_prompt,
+    element_for_index,
     sample_prompt_spec,
 )
+from src.rewards.authenticity_reward import AuthenticityReward
+from src.rewards.rubric_reward import RubricReward
+from src.utils.text_quality import QualityGate, text_metrics
 
+
+# ── pure helpers (no models, unit-testable) ──────────────────────────
+
+def repetition(text: str) -> float:
+    """
+    Distinct-bigram ratio in [0, 1]. Only useful for catching loops: word
+    salad repeats no bigrams and scores ~1.0, so this is NOT a quality
+    measure. Quality is QualityGate.
+    """
+    w = text.split()
+    if len(w) < 2:
+        return 0.0
+    b = list(zip(w, w[1:]))
+    return len(set(b)) / len(b)
+
+
+def anchor_overlap(candidate: str, anchor: str) -> float:
+    """Word-level Jaccard overlap, a guard against copying the anchor."""
+    a = set(candidate.lower().split())
+    b = set(anchor.lower().split())
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+@dataclass
+class SelectionConfig:
+    """
+    How candidates are chosen once they have passed the gates.
+
+    min_judge_reward: hard gate on judge agreement. 1.0 requires the blind
+    judge to name the target score exactly. 0.5 also admits one level off.
+    None disables the gate (the old behaviour, under which 7.4% of
+    accepted rows in rounds 2 to 4 had judge reward 0).
+
+    min_auth_delta: absolute floor on authenticity delta, taken from
+    held-out real BIPs (scripts/score_real_reference.py). None disables it.
+    Without a floor, the batch z-score means the best of 8 poor candidates
+    still wins.
+
+    rank_by: "auth" ranks the survivors by authenticity, "combined" by
+    alpha * auth + (1 - alpha) * judge reward.
+    """
+    keep_top_k: int = 2
+    min_judge_reward: float | None = 1.0
+    min_auth_delta: float | None = None
+    rank_by: str = "auth"
+    alpha: float = 0.5
+
+
+def gate_reasons(cand: dict, anchor_text: str, gate: QualityGate,
+                 min_repetition: float, leak_threshold: float) -> list[str]:
+    reasons = gate.check(cand["text"], stopped=cand.get("stopped"))
+    if "short" in reasons:
+        return reasons
+    if repetition(cand["text"]) < min_repetition:
+        reasons.append("loop")
+    if anchor_overlap(cand["text"], anchor_text) > leak_threshold:
+        reasons.append("anchor_leak")
+    if cand.get("auth_floor_ok") is False:
+        reasons.append("nll_ceiling")
+    return reasons
+
+
+def select_candidates(cands: list[dict], sel: SelectionConfig) -> list[int]:
+    """Indices of the candidates to keep, best first."""
+    eligible = []
+    for j, c in enumerate(cands):
+        if c["gate"] or not c.get("scored"):
+            continue
+        if (sel.min_judge_reward is not None
+                and c["rubric_reward"] < sel.min_judge_reward):
+            continue
+        if (sel.min_auth_delta is not None
+                and c["auth_delta"] < sel.min_auth_delta):
+            continue
+        eligible.append(j)
+
+    if sel.rank_by == "combined":
+        def key(j):
+            c = cands[j]
+            return sel.alpha * c["auth_rel"] + (1 - sel.alpha) * c["rubric_reward"]
+    else:
+        def key(j):
+            return cands[j]["auth_rel"]
+
+    eligible.sort(key=key, reverse=True)
+    return eligible[:sel.keep_top_k]
+
+
+def _json_default(o):
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    return str(o)
+
+
+def read_records(path: Path) -> list[dict]:
+    """Reads candidates.jsonl, skipping a partial last line from a killed job."""
+    records = []
+    if not path.exists():
+        return records
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def finalize_round(
+    output_dir: str | Path,
+    n_prompts: int,
+    gate: QualityGate,
+    selection: SelectionConfig,
+    min_repetition: float = 0.60,
+    leak_threshold: float = 0.85,
+) -> pd.DataFrame:
+    """
+    Builds accepted.jsonl and round_stats.json from candidates.jsonl.
+
+    Gate reasons and selection are recomputed from the stored candidate
+    text and scores, so the same call re-selects with new thresholds and
+    needs no GPU (run_bon_round.py --reselect).
+    """
+    output_dir = Path(output_dir)
+    records = [r for r in read_records(output_dir / "candidates.jsonl")
+               if r["i"] < n_prompts]
+
+    rows = []
+    gate_counts = Counter()
+    n_cands = n_scored = 0
+    pool_match, pool_delta, pool_auth_abs = [], [], []
+    sel_match, sel_delta = [], []
+    zero_accept = 0
+
+    for rec in records:
+        cands = rec["candidates"]
+        for c in cands:
+            n_cands += 1
+            c["gate"] = gate_reasons(c, rec["anchor_text"], gate,
+                                     min_repetition, leak_threshold)
+            for r in c["gate"]:
+                gate_counts[r] += 1
+            c["selected"] = False
+            if c.get("scored"):
+                n_scored += 1
+                if not c["gate"]:
+                    pool_match.append(float(c["rubric_reward"] == 1.0))
+                    pool_delta.append(c["auth_delta"])
+                    pool_auth_abs.append(c["auth_abs"])
+
+        chosen = select_candidates(cands, selection)
+        if not chosen:
+            zero_accept += 1
+        for j in chosen:
+            c = cands[j]
+            c["selected"] = True
+            sel_match.append(float(c["rubric_reward"] == 1.0))
+            sel_delta.append(c["auth_delta"])
+            rows.append({
+                "prompt_idx": rec["i"],
+                "element": rec["element"],
+                "target_score": rec["target_score"],
+                "anchor_score": rec.get("anchor_score"),
+                "anchor_fallback": rec.get("anchor_fallback"),
+                "rubric_text": rec["rubric_text"],
+                "anchor_text": rec["anchor_text"],
+                "prompt": rec["prompt"],
+                "completion": c["text"],
+                "judge_pred": c["judge_pred"],
+                "auth_delta": c["auth_delta"],
+                "auth_reward": c["auth_rel"],
+                "auth_reward_abs": c["auth_abs"],
+                "rubric_reward": c["rubric_reward"],
+                "combined_reward": (selection.alpha * c["auth_rel"]
+                                    + (1 - selection.alpha) * c["rubric_reward"]),
+                "stopped": c["stopped"],
+                "repetition": repetition(c["text"]),
+                "n_words": c["n_words"],
+            })
+
+    df = pd.DataFrame(rows)
+
+    stats = {
+        "n_prompts_requested": n_prompts,
+        "n_prompts_done": len(records),
+        "n_accepted": len(df),
+        "prompts_with_zero_accepted": zero_accept,
+        "n_candidates": n_cands,
+        "n_candidates_scored": n_scored,
+        "gate_fail_counts": dict(gate_counts),
+        "selection": asdict(selection),
+        "gate": asdict(gate),
+        # Selection lift: the gated pool is the "random pick" baseline,
+        # the accepted rows are the "best-of-n pick".
+        "gated_pool_n": len(pool_match),
+        "gated_pool_judge_match": float(np.mean(pool_match)) if pool_match else None,
+        "gated_pool_mean_auth_delta": float(np.mean(pool_delta)) if pool_delta else None,
+        "gated_pool_mean_auth_abs": float(np.mean(pool_auth_abs)) if pool_auth_abs else None,
+        "accepted_judge_match": float(np.mean(sel_match)) if sel_match else None,
+        "accepted_mean_auth_delta": float(np.mean(sel_delta)) if sel_delta else None,
+    }
+    if len(df):
+        m = [text_metrics(t) for t in df["completion"]]
+        stats.update({
+            "accepted_mean_words": float(df["n_words"].mean()),
+            "accepted_ends_punct": float(np.mean([x["ends_punct"] for x in m])),
+            "accepted_mean_run_together_per_100": float(np.mean([x["rt"] for x in m])),
+            "accepted_mean_title_case": float(np.mean([x["tc"] for x in m])),
+            "accepted_mean_marks_per_100": float(np.mean([x["marks"] for x in m])),
+            "accepted_by_target": {str(k): int(v) for k, v in
+                                   df["target_score"].value_counts().items()},
+            "accepted_by_element": {str(k): int(v) for k, v in
+                                    df["element"].value_counts().items()},
+            "accepted_by_element_target": {
+                f"{e}|{t}": int(v) for (e, t), v in
+                df.groupby(["element", "target_score"]).size().items()
+            },
+        })
+
+    with open(output_dir / "round_stats.json", "w") as f:
+        json.dump(stats, f, indent=2, default=_json_default)
+    df.to_json(output_dir / "accepted.jsonl", orient="records", lines=True)
+
+    print("\nRound summary")
+    for k, v in stats.items():
+        print(f"  {k}: {v}")
+    return df
+
+
+# ── the round ────────────────────────────────────────────────────────
 
 class BestOfNRound:
     """
-    One round of iterative rejection-sampling fine-tuning.
+    One round of best-of-n generation, scoring and selection.
 
-    For each prompt: generate N candidates, score all N with both
-    reward models, keep the top k. Accepted candidates become the
-    training set for the next generator checkpoint.
+    For each prompt: sample N candidates, run the quality gate, score every
+    candidate with the authenticity model and the blind judge, then keep
+    the top k among candidates that pass the gate AND (by default) whose
+    blind judge prediction equals the target score.
 
-    Why this rather than policy-gradient optimization: the reward is a
-    Python function that decodes text and calls two separate language
-    models, which does not fit TRL's get_reward interface. Selection
-    also only requires that the reward RANK candidates correctly within
-    a prompt, so any uniform bias in the judge cancels out.
+    Everything is written to candidates.jsonl as it goes: all N candidates
+    per prompt with gate reasons, judge prediction and raw output, and the
+    authenticity components. A killed job resumes from the last complete
+    prompt. Prompt specs are a pure function of (seed, prompt index), so a
+    resumed run is identical to an uninterrupted one.
 
-    Device placement: the generator, authenticity model, and judge are
-    three large models. Holding all three plus optimizer state on one
-    A100 caused OOM during the retrain step. Each takes its own device
-    when available, and release() frees them before retraining.
+    Device placement: generator, authenticity model and judge are three
+    large models. Holding all three plus optimizer state on one A100
+    caused OOM at retrain, so release() frees them before retraining.
     """
-
-    # A candidate below this distinct-bigram ratio is degenerate and is
-    # rejected outright rather than merely penalized.
-    #
-    # Round 2 exposed why this is necessary. With max_new_tokens raised
-    # to 512, 74% of accepted candidates fell below 0.7, and the worst
-    # scored 0.038 -- one sentence repeated to fill the token budget.
-    # The soft multiplier could not prevent it: if all eight candidates
-    # for a prompt loop, selection keeps the least-looping loop.
-    # Best-of-n cannot select quality that was never sampled.
-    MIN_REPETITION = 0.60
 
     def __init__(
         self,
@@ -65,29 +295,38 @@ class BestOfNRound:
         generator_adapter: str,
         output_dir: str,
         n_candidates: int = 8,
-        keep_top_k: int = 2,
-        alpha: float = 0.5,
-        min_reward: float = 0.0,
+        selection: SelectionConfig | None = None,
+        gate: QualityGate | None = None,
+        min_repetition: float = 0.60,
         anchor_similarity_threshold: float = 0.85,
-        min_repetition: float | None = None,
+        score_gated_out: bool = True,
+        elements: list[str] | None = None,
+        score_weights: dict[int, float] | None = None,
+        max_prompt_tokens: int = 640,
+        sampler_kwargs: dict | None = None,
         seed: int = 42,
         generator_device: str = "cuda:0",
         auth_device: str = "cuda:1",
         rubric_device: str = "cuda:2",
     ):
-        self.anchor_df = anchor_df
         self.output_dir = Path(output_dir)
         self.n_candidates = n_candidates
-        self.keep_top_k = keep_top_k
-        self.alpha = alpha
-        self.min_reward = min_reward
-        self.anchor_similarity_threshold = anchor_similarity_threshold
-        self.min_repetition = (
-            self.MIN_REPETITION if min_repetition is None else min_repetition
-        )
-        self.rng = np.random.default_rng(seed)
+        self.selection = selection or SelectionConfig()
+        self.gate = gate or QualityGate()
+        self.min_repetition = min_repetition
+        self.leak_threshold = anchor_similarity_threshold
+        self.score_gated_out = score_gated_out
+        self.score_weights = score_weights
+        self.max_prompt_tokens = max_prompt_tokens
+        self.seed = seed
+
+        if elements:
+            anchor_df = anchor_df[anchor_df["Element_numberX"].isin(elements)]
+        self.anchor_df = anchor_df
+        self.elements = sorted(anchor_df["Element_numberX"].unique().tolist())
 
         os.makedirs(self.output_dir, exist_ok=True)
+        self._check_run_config(generator_adapter, sampler_kwargs or {})
 
         n_gpu = torch.cuda.device_count()
         print(f"Visible GPUs: {n_gpu}")
@@ -96,7 +335,6 @@ class BestOfNRound:
                   f"cuda:0. Run generation with --skip_retrain and "
                   f"retrain separately with --retrain_only.")
             generator_device = auth_device = rubric_device = "cuda:0"
-
         print(f"Placement: generator={generator_device}  "
               f"auth={auth_device}  rubric={rubric_device}")
 
@@ -108,23 +346,50 @@ class BestOfNRound:
             few_shot_examples=few_shot,
             batch_size=n_candidates,
         )
-
         self.sampler = CandidateSampler(
-            adapter_path=generator_adapter, device=generator_device
+            adapter_path=generator_adapter,
+            device=generator_device,
+            **(sampler_kwargs or {}),
         )
 
-        self.element_cycler = ElementCycler(
-            anchor_df["Element_numberX"].unique().tolist(), self.rng
-        )
+    # -- run bookkeeping ------------------------------------------------
+
+    def _check_run_config(self, generator_adapter: str, sampler_kwargs: dict):
+        """
+        Resuming with different settings would mix incompatible candidates
+        in one file. Refuse unless the settings match the first run.
+        """
+        cfg = {
+            "generator_adapter": generator_adapter,
+            "seed": self.seed,
+            "n_candidates": self.n_candidates,
+            "elements": self.elements,
+            "score_weights": self.score_weights,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "sampler_kwargs": sampler_kwargs,
+        }
+        path = self.output_dir / "run_config.json"
+        if path.exists():
+            old = json.loads(path.read_text())
+            if old != json.loads(json.dumps(cfg, default=_json_default)):
+                raise RuntimeError(
+                    f"{path} differs from the current settings. Use a new "
+                    f"--output directory, or delete candidates.jsonl and "
+                    f"run_config.json to start over.\nold: {old}\nnew: {cfg}"
+                )
+        else:
+            path.write_text(json.dumps(cfg, indent=2, default=_json_default))
+
+    def _load_done(self, path: Path) -> set[int]:
+        records = read_records(path)
+        # rewrite without any partial trailing line so appends stay valid
+        with open(path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r, default=_json_default) + "\n")
+        return {r["i"] for r in records}
 
     def release(self):
-        """
-        Frees the generator and both reward models.
-
-        Generation and scoring are fully finished before retraining
-        starts. Without this the retrain step inherits ~30 GB of
-        resident weights and OOMs while allocating optimizer state.
-        """
+        """Frees the generator and both reward models before retraining."""
         for attr in ("sampler", "auth", "rubric"):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -132,251 +397,154 @@ class BestOfNRound:
         torch.cuda.empty_cache()
         print("Released generation and reward models.")
 
-    def _repetition(self, text: str) -> float:
-        """
-        Distinct-bigram ratio in [0, 1]. Higher means less repetitive.
-        """
-        w = text.split()
-        if len(w) < 2:
-            return 0.0
-        b = list(zip(w, w[1:]))
-        return len(set(b)) / len(b)
+    # -- one prompt -----------------------------------------------------
 
-    def _anchor_overlap(self, candidate: str, anchor: str) -> float:
-        """
-        Word-level Jaccard overlap between candidate and anchor. Guards
-        against the generator copying its reference. A lightweight
-        proxy for embedding similarity, chosen to avoid loading a third
-        model inside the generation loop.
-        """
-        a = set(candidate.lower().split())
-        b = set(anchor.lower().split())
-        if not a or not b:
-            return 0.0
-        return len(a & b) / len(a | b)
+    def _process_prompt(self, i: int) -> dict:
+        rng = np.random.default_rng([self.seed, i])
+        element = element_for_index(self.elements, self.seed, i)
+        spec = sample_prompt_spec(
+            self.anchor_df, RubricReward, element, rng, self.score_weights
+        )
+        target = spec["target_score"]
+
+        prompt = build_generation_prompt(
+            element, target, spec["rubric_text"], spec["anchor_text"],
+            tokenizer=self.sampler.tokenizer,
+            max_prompt_tokens=self.max_prompt_tokens,
+        )
+        samples = self.sampler.sample_detailed(prompt, n=self.n_candidates)
+
+        cands = []
+        for s in samples:
+            c = {
+                "text": s["text"],
+                "n_words": len(s["text"].split()),
+                "n_tokens": s["n_tokens"],
+                "stopped": s["stopped"],
+                "scored": False,
+                "selected": False,
+            }
+            c["gate"] = gate_reasons(c, spec["anchor_text"], self.gate,
+                                     self.min_repetition, self.leak_threshold)
+            cands.append(c)
+
+        to_score = [
+            j for j, c in enumerate(cands)
+            if "short" not in c["gate"]
+            and (self.score_gated_out or not c["gate"])
+        ]
+        if to_score:
+            texts = [cands[j]["text"] for j in to_score]
+            els = [element] * len(texts)
+            a = self.auth.score_candidates(texts, elements=els, batch_size=4)
+            preds, raws = self.rubric.predict(texts, els, return_raw=True)
+            for k, j in enumerate(to_score):
+                c = cands[j]
+                c.update({
+                    "scored": True,
+                    "judge_pred": preds[k],
+                    "judge_raw": raws[k],
+                    "rubric_reward": self.rubric._compute_reward(preds[k], target),
+                    "auth_delta": a["delta"][k],
+                    "auth_rel": a["reward_rel"][k],
+                    "auth_abs": a["reward_abs"][k],
+                    "nll_ft": a["nll_finetuned"][k],
+                    "auth_floor_ok": bool(a["floor"][k]),
+                })
+                c["gate"] = gate_reasons(c, spec["anchor_text"], self.gate,
+                                         self.min_repetition, self.leak_threshold)
+
+        for j in select_candidates(cands, self.selection):
+            cands[j]["selected"] = True
+
+        return {
+            "i": i,
+            "element": element,
+            "target_score": target,
+            "anchor_score": spec["anchor_score"],
+            "anchor_fallback": spec["anchor_fallback"],
+            "anchor_person": spec["anchor_person"],
+            "rubric_text": spec["rubric_text"],
+            "anchor_text": spec["anchor_text"],
+            "prompt": prompt,
+            "candidates": cands,
+        }
+
+    # -- main loop ------------------------------------------------------
 
     def run(self, n_prompts: int = 500, log_every: int = 25) -> pd.DataFrame:
-        accepted_rows = []
-        all_scores = []
-        rejected_leakage = 0
-        rejected_degenerate = 0
-        rejected_low = 0
+        cand_path = self.output_dir / "candidates.jsonl"
+        done = self._load_done(cand_path)
+        if done:
+            print(f"Resuming: {len(done)} prompts already in {cand_path}")
 
-        for i in range(n_prompts):
-            spec = sample_prompt_spec(
-                self.anchor_df, self.rubric, self.element_cycler, self.rng
-            )
-
-            prompt = build_generation_prompt(
-                spec["element"], spec["target_score"],
-                spec["rubric_text"], spec["anchor_text"],
-            )
-
-            candidates = self.sampler.sample(prompt, n=self.n_candidates)
-            candidates = [c for c in candidates if len(c.split()) >= 10]
-            if not candidates:
-                continue
-
-            # hard filters applied before scoring: a degenerate or
-            # copied candidate should never enter the training set
-            # regardless of how it ranks against its siblings
-            keep = []
-            for c in candidates:
-                if self._repetition(c) < self.min_repetition:
-                    rejected_degenerate += 1
-                elif self._anchor_overlap(c, spec["anchor_text"]) \
-                        > self.anchor_similarity_threshold:
-                    rejected_leakage += 1
-                else:
-                    keep.append(c)
-            if not keep:
-                continue
-            candidates = keep
-
-            elements = [spec["element"]] * len(candidates)
-            targets = [spec["target_score"]] * len(candidates)
-
-            # normalized scores drive selection: z-scoring within the
-            # batch spreads the signal across candidates for the same
-            # prompt, which is what ranking needs
-            auth_scores = self.auth.score_batch(
-                candidates, batch_size=4, normalize=True
-            )
-            # absolute scores are logged for cross-round comparison.
-            # the normalized mean sits near 0.5 by construction, so it
-            # cannot show whether round N is better than round N-1.
-            auth_abs = self.auth.score_batch(
-                candidates, batch_size=4, normalize=False
-            )
-            rubric_scores = self.rubric.score(candidates, elements, targets)
-
-            combined = [
-                self.alpha * a + (1 - self.alpha) * r
-                for a, r in zip(auth_scores, rubric_scores)
-            ]
-
-            order = np.argsort(combined)[::-1]
-            kept = 0
-            for idx in order:
-                if kept >= self.keep_top_k:
-                    break
-                if combined[idx] < self.min_reward:
-                    rejected_low += 1
+        n_new = n_acc = 0
+        with open(cand_path, "a") as f:
+            for i in range(n_prompts):
+                if i in done:
                     continue
-                accepted_rows.append({
-                    "element": spec["element"],
-                    "target_score": spec["target_score"],
-                    "rubric_text": spec["rubric_text"],
-                    "anchor_text": spec["anchor_text"],
-                    "prompt": prompt,
-                    "completion": candidates[idx],
-                    "auth_reward": auth_scores[idx],
-                    "auth_reward_abs": auth_abs[idx],
-                    "rubric_reward": rubric_scores[idx],
-                    "combined_reward": combined[idx],
-                    "repetition": self._repetition(candidates[idx]),
-                    "n_words": len(candidates[idx].split()),
-                })
-                kept += 1
+                rec = self._process_prompt(i)
+                f.write(json.dumps(rec, default=_json_default) + "\n")
+                f.flush()
+                n_new += 1
+                n_acc += sum(c["selected"] for c in rec["candidates"])
+                if n_new % log_every == 0:
+                    print(f"prompt {i + 1}/{n_prompts}  new={n_new}  "
+                          f"accepted_this_session={n_acc}", flush=True)
 
-            all_scores.extend(combined)
-
-            if (i + 1) % log_every == 0:
-                mean_c = float(np.mean(all_scores)) if all_scores else 0.0
-                print(f"prompt {i+1}/{n_prompts}  "
-                      f"accepted={len(accepted_rows)}  "
-                      f"mean_combined={mean_c:.4f}  "
-                      f"degenerate={rejected_degenerate}  "
-                      f"leakage={rejected_leakage}  "
-                      f"low={rejected_low}", flush=True)
-
-        df = pd.DataFrame(accepted_rows)
-
-        stats = {
-            "n_prompts": n_prompts,
-            "n_accepted": len(df),
-            "n_candidates_scored": len(all_scores),
-            "mean_combined_all": float(np.mean(all_scores)) if all_scores else 0.0,
-            "mean_combined_accepted": float(df["combined_reward"].mean())
-                if len(df) else 0.0,
-            "mean_auth_accepted": float(df["auth_reward"].mean())
-                if len(df) else 0.0,
-            # the comparable one across rounds
-            "mean_auth_abs_accepted": float(df["auth_reward_abs"].mean())
-                if len(df) else 0.0,
-            "mean_rubric_accepted": float(df["rubric_reward"].mean())
-                if len(df) else 0.0,
-            "mean_repetition_accepted": float(df["repetition"].mean())
-                if len(df) else 0.0,
-            "frac_repetition_below_0.7": float((df["repetition"] < 0.7).mean())
-                if len(df) else 0.0,
-            "mean_words_accepted": float(df["n_words"].mean())
-                if len(df) else 0.0,
-            "rejected_degenerate": rejected_degenerate,
-            "rejected_leakage": rejected_leakage,
-            "rejected_low_reward": rejected_low,
-        }
-        if len(df):
-            stats["accepted_by_score"] = df["target_score"].value_counts().to_dict()
-            stats["accepted_by_element"] = df["element"].value_counts().to_dict()
-
-        with open(self.output_dir / "round_stats.json", "w") as f:
-            json.dump(stats, f, indent=2, default=str)
-
-        df.to_json(
-            self.output_dir / "accepted.jsonl",
-            orient="records", lines=True,
+        return finalize_round(
+            self.output_dir, n_prompts, self.gate, self.selection,
+            self.min_repetition, self.leak_threshold,
         )
 
-        print("\nRound complete.")
-        for k, v in stats.items():
-            print(f"  {k}: {v}")
 
-        return df
-
+# ── retraining ───────────────────────────────────────────────────────
 
 def build_retrain_dataset(
     accepted_df: pd.DataFrame,
     tokenizer,
-    max_length: int = 1024,
+    max_length: int = 1280,
 ) -> Dataset:
     """
-    Converts accepted candidates into a tokenized dataset for the next
-    generator fine-tune. Prompt tokens are masked with -100 so loss is
-    computed only on the completion, mirroring generator_sft so each
-    round is the same procedure applied to progressively better data.
+    Tokenizes accepted candidates for the next generator fine-tune. Prompt
+    tokens are masked; EOS is appended to every completion and included in
+    the loss (see src/data/encoding.py). Rows that do not fit are dropped.
     """
-    hf = Dataset.from_dict({
-        "prompt": accepted_df["prompt"].tolist(),
-        "completion": accepted_df["completion"].tolist(),
-    })
-
-    def tokenize(batch):
-        input_ids_b, labels_b, attn_b = [], [], []
-
-        for prompt, completion in zip(batch["prompt"], batch["completion"]):
-            prompt_ids = tokenizer(
-                prompt, add_special_tokens=True,
-                truncation=True, max_length=max_length,
-            )["input_ids"]
-
-            full_ids = tokenizer(
-                prompt + completion, add_special_tokens=True,
-                truncation=True, max_length=max_length,
-            )["input_ids"]
-
-            prompt_len = min(len(prompt_ids), len(full_ids))
-
-            pad_len = max_length - len(full_ids)
-            input_ids = full_ids + [tokenizer.pad_token_id] * pad_len
-            attention_mask = [1] * len(full_ids) + [0] * pad_len
-
-            labels = [-100] * prompt_len + full_ids[prompt_len:]
-            labels = labels[:max_length]
-            labels = labels + [-100] * (max_length - len(labels))
-
-            input_ids_b.append(input_ids)
-            labels_b.append(labels)
-            attn_b.append(attention_mask)
-
-        return {
-            "input_ids": input_ids_b,
-            "labels": labels_b,
-            "attention_mask": attn_b,
-        }
-
-    return hf.map(
-        tokenize, batched=True,
-        remove_columns=["prompt", "completion"],
-        load_from_cache_file=False,
+    cols, dropped = encode_many(
+        tokenizer,
+        accepted_df["prompt"].tolist(),
+        accepted_df["completion"].tolist(),
+        max_length=max_length,
     )
+    print(f"Retrain dataset: {len(cols['input_ids'])} examples, "
+          f"{dropped} dropped for length")
+    if not cols["input_ids"]:
+        raise ValueError("No retrain examples fit in max_length.")
+    return Dataset.from_dict(cols)
 
-
-
-# append at the end of the file, after build_retrain_dataset
 
 def retrain_generator(
     accepted_df: pd.DataFrame,
     base_model_name: str,
     prev_adapter_path: str,
     output_dir: str,
-    num_train_epochs: int = 3,
-    per_device_train_batch_size: int = 4,
-    gradient_accumulation_steps: int = 8,
+    num_train_epochs: int = 2,
+    per_device_train_batch_size: int = 2,
+    gradient_accumulation_steps: int = 16,
     learning_rate: float = 2e-4,
     warmup_ratio: float = 0.05,
-    max_seq_length: int = 1024,
+    max_seq_length: int = 1280,
     seed: int = 42,
 ) -> None:
     """
-    Continues LoRA training on the previous round's adapter, using
-    this round's accepted candidates. Unlike GeneratorSFT's initial
-    warmup, which starts LoRA from scratch, each BoN round must
-    continue from the adapter the previous round produced -- otherwise
-    every round restarts from the SFT baseline and "best-of-n improves
-    the generator" would not hold. PeftModel.from_pretrained reads the
-    adapter's own saved LoRA config, so no fresh LoraConfig is needed
-    here.
+    Continues LoRA training on the previous adapter with this round's
+    accepted candidates.
+
+    Caution: each round that retrains on the previous round's output
+    compounds any defect in that output. In rounds 1 to 4 the run-together
+    rate in the last 100 words went 1.9, 5.0, 8.5, 10.2. With the gates on
+    this is much safer, but a single selection round from a clean SFT
+    checkpoint avoids the issue entirely.
     """
     os.makedirs(output_dir, exist_ok=True)
 
