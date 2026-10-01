@@ -76,9 +76,9 @@ p.add_argument("--rank_by", choices=["auth", "combined"], default="auth")
 p.add_argument("--alpha", type=float, default=0.5)
 
 # quality gate (defaults are provisional, see src/utils/text_quality.py)
-p.add_argument("--max_rt", type=float, default=2.0, help="run-together words per 100")
-p.add_argument("--max_title_case", type=float, default=0.40)
-p.add_argument("--min_marks", type=float, default=3.0, help="sentence marks per 100 words")
+p.add_argument("--max_rt", type=float, default=7.0, help="run-together words per 100")
+p.add_argument("--max_title_case", type=float, default=0.70)
+p.add_argument("--min_marks", type=float, default=1.0, help="sentence marks per 100 words")
 p.add_argument("--no_require_stop", action="store_true",
                help="Do not require an EOS before the token cap")
 p.add_argument("--require_end_punct", action="store_true")

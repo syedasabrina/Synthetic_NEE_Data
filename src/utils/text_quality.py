@@ -10,11 +10,12 @@ here are the ones that separate the pools from real BIPs: sentence-ending
 marks per 100 words, run-together words per 100 words and Title Case
 share, measured on the whole text and on the last 100 words.
 
-The default thresholds in QualityGate are PROVISIONAL. They were set from
-the reference values in the thread handoff (real BIPs: 6.4 to 7.2 marks,
-0.33 to 0.46 run-together, 0.16 to 0.165 Title Case) with wide margins.
-Run scripts/score_real_reference.py to see what share of real BIPs they
-reject, then adjust before a production run.
+The defaults (run-together 7, Title Case 0.70, marks 1.0) come from
+scripts/sweep_gate.py on the 11,953 real BIPs: 3.9% of real BIPs rejected
+(Element 5: 6.4%), 20% of the old degraded pool still passing. Title Case
+is a weak criterion for Element 5, where citations and proper nouns put
+24% of real BIPs above 0.40. This gate only removes gross outliers; the stop
+test, the judge and the authenticity model do the fine selection.
 """
 
 from __future__ import annotations
@@ -67,9 +68,9 @@ class QualityGate:
     still slips through.
     """
     min_words: int = 10
-    max_rt_per_100: float = 2.0
-    max_title_case: float = 0.40
-    min_marks_per_100: float = 3.0
+    max_rt_per_100: float = 7.0
+    max_title_case: float = 0.70
+    min_marks_per_100: float = 1.0
     require_stop: bool = True
     require_end_punct: bool = False
 

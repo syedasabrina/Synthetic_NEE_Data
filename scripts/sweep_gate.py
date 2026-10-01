@@ -108,6 +108,9 @@ def main():
             row["old_pool_pass"] = float(1 - (pf["rt"] | pf["tc"] | pf["marks"]).mean())
         rows.append(row)
     grid = pd.DataFrame(rows)
+    if "old_pool_pass" not in grid:
+        print(f"\nNo pool rows found for {args.pools!r}; old_pool_pass is unavailable.")
+        grid["old_pool_pass"] = float("nan")
 
     ok = grid[(grid["real_reject"] <= args.max_real_reject)
               & (grid["worst_element_reject"] <= args.max_element_reject)]
