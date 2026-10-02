@@ -20,6 +20,8 @@ Two isolation guarantees are enforced here:
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 from pathlib import Path
 from typing import Optional
@@ -42,8 +44,28 @@ MIN_TOKENS = 50
 
 GOLD_PATH = "data/gold/combined_annotations_with_SupervisorScore.csv"
 
-# The gold file was exported with Windows-era encoding, not UTF-8.
+# The gold CSV mixes two encodings: most rows are MacRoman (an en dash is byte
+# 0xD0) and some rows are UTF-8 (a curly apostrophe is bytes E2 80 99). No
+# single codec decodes both. It is read as latin-1, which maps every byte to
+# a character losslessly, and each text is repaired by _repair_gold_text.
 GOLD_ENCODING = "latin-1"
+
+_UTF8_PUNCT = re.compile(rb"\xe2\x80[\x80-\xbf]")
+
+
+def _repair_gold_text(s: str) -> str:
+    """
+    Decodes UTF-8 punctuation sequences (E2 80 xx: curly quotes, dashes,
+    bullets, ellipsis) as UTF-8 and every other byte as MacRoman.
+    """
+    b = s.encode("latin-1")
+    out, pos = [], 0
+    for m in _UTF8_PUNCT.finditer(b):
+        out.append(b[pos:m.start()].decode("mac_roman"))
+        out.append(m.group().decode("utf-8"))
+        pos = m.end()
+    out.append(b[pos:].decode("mac_roman"))
+    return "".join(out)
 
 
 def load_gold_person_ids(path: str | Path = GOLD_PATH) -> set:
@@ -165,6 +187,9 @@ def load_gold(
     """
     path = Path(path)
     df = pd.read_csv(path, encoding=GOLD_ENCODING)
+    df[text_col] = df[text_col].map(
+        lambda t: _repair_gold_text(t) if isinstance(t, str) else t
+    )
 
     if drop_unscoreable:
         before = len(df)

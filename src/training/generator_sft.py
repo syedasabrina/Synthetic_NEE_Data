@@ -16,6 +16,7 @@ from transformers import (
 )
 
 from src.data.encoding import encode_many
+from src.generation.sampler import fit_anchor
 from src.utils.config import GeneratorSFTConfig
 
 
@@ -73,6 +74,7 @@ def build_sft_dataset(
     tokenizer,
     max_length: int = 1280,
     rng: np.random.Generator | None = None,
+    max_reference_tokens: int = 400,
 ) -> Dataset:
     """
     Builds the SFT dataset. Prompt tokens are masked, EOS is appended to
@@ -89,7 +91,10 @@ def build_sft_dataset(
         # generic score-4 guidance during warmup; no score conditioning
         # happens until selection
         rubric_text = RubricReward.RUBRIC[element][4]
-        prompts.append(build_sft_prompt(element, rubric_text, pair["reference_text"]))
+        # cap the reference like the BoN anchor, so length-based drops depend
+        # on the target alone instead of on two full BIPs
+        reference = fit_anchor(tokenizer, pair["reference_text"], max_reference_tokens)
+        prompts.append(build_sft_prompt(element, rubric_text, reference))
         completions.append(pair["target_text"])
 
     cols, dropped = encode_many(tokenizer, prompts, completions, max_length)
@@ -209,6 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=None)
+    parser.add_argument("--max_reference_tokens", type=int, default=400)
     parser.add_argument("--smoke_test", action="store_true")
     args = parser.parse_args()
 
@@ -242,8 +248,9 @@ if __name__ == "__main__":
     rng = np.random.default_rng(config.seed)
     dataset = build_sft_dataset(
         anchor_df, tokenizer,
-        max_length=512 if args.smoke_test else config.max_seq_length,
+        max_length=config.max_seq_length,
         rng=rng,
+        max_reference_tokens=args.max_reference_tokens,
     )
 
     if args.smoke_test:
