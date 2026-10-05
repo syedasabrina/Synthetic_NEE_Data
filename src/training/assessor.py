@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -62,11 +63,34 @@ def build_assessor_dataset(
     )
 
 
+def split_by_group(n: int, groups, fraction: float, seed: int = 42):
+    """
+    Index split into (train_idx, val_idx). With groups, whole groups go to
+    one side: the two synthetic BIPs kept from the same prompt share an
+    anchor and an element, so splitting them across train and validation
+    would make the validation score optimistic.
+    """
+    rng = np.random.default_rng(seed)
+    if fraction <= 0:
+        return np.arange(n), np.array([], dtype=int)
+    if groups is None:
+        order = rng.permutation(n)
+        k = max(1, int(round(n * fraction)))
+        return np.sort(order[k:]), np.sort(order[:k])
+    groups = np.asarray(groups)
+    uniq = rng.permutation(np.unique(groups))
+    k = max(1, int(round(len(uniq) * fraction)))
+    val_groups = set(uniq[:k].tolist())
+    is_val = np.array([g in val_groups for g in groups.tolist()])
+    return np.flatnonzero(~is_val), np.flatnonzero(is_val)
+
+
 def load_condition_data(
     condition: str,
     synthetic_path: str | None,
     anchor_df: pd.DataFrame | None,
     seed: int = 42,
+    judge_labelled_path: str | None = None,
 ) -> tuple[list[str], list[str], list[int]]:
     """
     Assembles training data for one experimental condition.
@@ -86,6 +110,13 @@ def load_condition_data(
          comes from label quality.
 
     D -- hybrid: both pools combined.
+
+    E -- judge_real: real BIPs labelled by the judge (see
+         scripts/label_real_with_judge.py), resampled to the synthetic
+         set's exact (element, score) counts. The control that separates
+         the value of the generated text from the value of the judge's
+         labels. If E matches A, generation adds nothing over labelling
+         real BIPs with the judge.
     """
     rng = np.random.default_rng(seed)
 
@@ -124,6 +155,29 @@ def load_condition_data(
     if condition == "synthetic_only":
         return _synthetic()
 
+    if condition == "judge_real":
+        if not (judge_labelled_path and synthetic_path):
+            raise ValueError("judge_real needs judge_labelled_path and synthetic_path")
+        jl = pd.read_json(judge_labelled_path, lines=True)
+        jl = jl[jl["judge_pred"].isin([0, 2, 4])].copy()
+        jl["judge_pred"] = jl["judge_pred"].astype(int)
+        syn = pd.read_json(synthetic_path, lines=True)
+        counts = syn.groupby(["element", "target_score"]).size()
+        parts, skipped = [], 0
+        for (el, sc), n in counts.items():
+            pool = jl[(jl["element"] == el) & (jl["judge_pred"] == int(sc))]
+            if len(pool) == 0:
+                skipped += int(n)
+                continue
+            parts.append(pool.sample(
+                n=int(n), replace=len(pool) < n,
+                random_state=int(rng.integers(0, 1_000_000))))
+        if skipped:
+            print(f"judge_real: {skipped} synthetic rows have no judge-labelled "
+                  f"real BIP in the same element and score, so they are omitted")
+        out = pd.concat(parts)
+        return out["text"].tolist(), out["element"].tolist(), out["judge_pred"].tolist()
+
     if condition == "real_noisy":
         return _real()
 
@@ -138,6 +192,22 @@ def load_condition_data(
         return st + rt, se + re_, ss + rs
 
     raise ValueError(f"unknown condition: {condition}")
+
+
+@torch.no_grad()
+def predict_labels(model, tokenizer, texts, elements, batch_size=8, max_length=1024):
+    """Predicted class indices for texts, using the training-time element prefix."""
+    model.eval()
+    device = next(model.parameters()).device
+    prefixed = [f"{e}: {t}" for e, t in zip(elements, texts)]
+    preds = []
+    for i in range(0, len(prefixed), batch_size):
+        enc = tokenizer(
+            prefixed[i:i + batch_size], return_tensors="pt", truncation=True,
+            max_length=max_length, padding=True,
+        ).to(device)
+        preds.extend(model(**enc).logits.float().argmax(dim=-1).cpu().tolist())
+    return preds
 
 
 def setup_assessor(
@@ -276,7 +346,14 @@ def train_assessor(
     tokenizer,
     class_weights: torch.Tensor | None = None,
     domain_checkpoint: str | None = "models/BIPDomainSFT",
+    val: tuple[list[str], list[str], list[int]] | None = None,
 ) -> None:
+    """
+    val: (texts, elements, class-index labels) held back from the training
+    data. It is scored after the model is saved and written to
+    val_metrics.json, so hyperparameters can be chosen without looking at
+    the gold set.
+    """
     os.makedirs(config.output_dir, exist_ok=True)
 
     model, _ = setup_assessor(
@@ -334,3 +411,23 @@ def train_assessor(
     model.save_pretrained(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
     print(f"Saved to {config.output_dir}")
+
+    if val is not None and len(val[0]):
+        try:
+            from src.evaluation.metrics import (
+                agreement_metrics, quadratic_weighted_kappa,
+            )
+            v_texts, v_elements, v_labels = val
+            preds = predict_labels(
+                model, tokenizer, v_texts, v_elements,
+                max_length=config.max_seq_length,
+            )
+            m = {"n": len(v_labels),
+                 "qwk": quadratic_weighted_kappa(v_labels, preds),
+                 **agreement_metrics(v_labels, preds)}
+            with open(Path(config.output_dir) / "val_metrics.json", "w") as f:
+                json.dump(m, f, indent=2)
+            print(f"Validation slice (n={m['n']}): QWK {m['qwk']:.3f}  "
+                  f"exact {m['exact_agreement']:.3f}")
+        except Exception as e:  # the model is already saved
+            print(f"WARNING: validation scoring failed ({e!r}); model is saved.")

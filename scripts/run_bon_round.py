@@ -56,6 +56,9 @@ p.add_argument("--n_prompts", type=int, default=500)
 p.add_argument("--n_candidates", type=int, default=8)
 p.add_argument("--elements", nargs="+", default=None,
                help="Restrict to these elements, e.g. Element1 Element2 Element6 Element7")
+p.add_argument("--score_weights", default=None,
+               help="Target score mix for levels 0,2,4 as three comma-separated "
+                    "numbers, e.g. 0.3,0.35,0.35. Default is 0.1,0.35,0.55")
 
 # decoding
 p.add_argument("--max_new_tokens", type=int, default=512)
@@ -94,6 +97,13 @@ p.add_argument("--retrain_only", action="store_true",
 p.add_argument("--reselect", action="store_true",
                help="Rebuild accepted.jsonl from candidates.jsonl with the settings above; no GPU needed")
 args = p.parse_args()
+
+score_weights = None
+if args.score_weights:
+    w = [float(x) for x in args.score_weights.split(",")]
+    if len(w) != 3 or min(w) < 0 or abs(sum(w) - 1.0) > 1e-6:
+        p.error("--score_weights needs three non-negative numbers that sum to 1")
+    score_weights = {0: w[0], 2: w[1], 4: w[2]}
 
 gate = QualityGate(
     max_rt_per_100=args.max_rt,
@@ -152,6 +162,7 @@ else:
         gate=gate,
         score_gated_out=not args.skip_scoring_failed,
         elements=args.elements,
+        score_weights=score_weights,
         max_prompt_tokens=args.max_prompt_tokens,
         sampler_kwargs=dict(
             max_new_tokens=args.max_new_tokens,
