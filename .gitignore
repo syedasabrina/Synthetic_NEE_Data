@@ -47,3 +47,4 @@ models/BIPDomainSFT/checkpoint-*
 bon_slim*
 .DS_Store
 *.zip
+data/derived/
