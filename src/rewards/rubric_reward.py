@@ -82,6 +82,7 @@ class RubricReward:
         use_chat_template: bool = True,
         batch_size: int = 8,
         max_length: int = 3072,
+        chat_template_kwargs: dict | None = None,
     ):
         """
         device: accepts "cuda:2" and similar so the judge can sit on a GPU
@@ -102,6 +103,9 @@ class RubricReward:
         self.use_chat_template = use_chat_template
         self.batch_size = batch_size
         self.max_length = max_length
+        # e.g. {"enable_thinking": False} for Qwen models that think by default.
+        # None keeps the prompt exactly as before, so the Gemma judge is unchanged.
+        self.chat_template_kwargs = chat_template_kwargs or {}
 
         print(f"Loading rubric judge: {model_name} on {device}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -115,11 +119,18 @@ class RubricReward:
         model_cls = (Gemma4ForConditionalGeneration
                      if "gemma-4" in model_name.lower()
                      else AutoModelForCausalLM)
-        self.model = model_cls.from_pretrained(
-            model_name,
-            dtype=torch.bfloat16,
-            device_map=device,
-        )
+        try:
+            self.model = model_cls.from_pretrained(
+                model_name, dtype=torch.bfloat16, device_map=device,
+            )
+        except (ValueError, KeyError) as e:
+            # some multimodal checkpoints are not registered for causal LM loading
+            print(f"{model_cls.__name__} could not load {model_name} ({e!r}); "
+                  f"trying AutoModelForImageTextToText")
+            from transformers import AutoModelForImageTextToText
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_name, dtype=torch.bfloat16, device_map=device,
+            )
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -140,6 +151,7 @@ class RubricReward:
             probe = self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": "x"}],
                 tokenize=False, add_generation_prompt=True,
+                **self.chat_template_kwargs,
             )
             bos = getattr(self.tokenizer, "bos_token", None)
             self._template_has_bos = bool(bos) and probe.startswith(bos)
@@ -222,6 +234,7 @@ Which score does this response earn? Reply with only the number 0, 2, or 4."""
                 [{"role": "user", "content": prompt}],
                 tokenize=False,
                 add_generation_prompt=True,
+                **self.chat_template_kwargs,
             )
         return prompt + "\nScore:"
 

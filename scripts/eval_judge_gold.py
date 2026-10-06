@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--few_shot_per_cell", type=int, default=1,
                     help="0 evaluates zero-shot (no gold rows in the prompt)")
     ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--no_thinking", action="store_true",
+                    help="pass enable_thinking=False to the chat template (Qwen models)")
     ap.add_argument("--n_boot", type=int, default=2000)
     ap.add_argument("--out", required=True, help="output prefix, e.g. results/judge_gold_e4b")
     args = ap.parse_args()
@@ -117,6 +119,7 @@ def main():
         device="cuda",
         few_shot_examples=few_shot,
         batch_size=args.batch_size,
+        chat_template_kwargs={"enable_thinking": False} if args.no_thinking else None,
     )
 
     preds, raws = judge.predict(
