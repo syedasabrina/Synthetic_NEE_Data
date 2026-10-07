@@ -63,6 +63,34 @@ def build_assessor_dataset(
     )
 
 
+VAL_SPLIT_SEED = 20261007
+
+
+def real_validation_split(judge_labelled_path, fraction=0.1, seed=VAL_SPLIT_SEED):
+    """
+    Validation set of REAL BIPs labelled by the judge, chosen by principal.
+
+    Used to choose between hyperparameter settings without touching the
+    gold set. A validation slice cut from the synthetic data measures how
+    well the assessor fits synthetic text, which the smoke test showed is a
+    poor guide to real text (validation QWK 0.265, gold QWK 0.018). Here
+    the assessor is scored on real BIPs, on how well it reproduces the judge.
+
+    The seed is fixed, so every condition and every setting is validated on
+    the same rows, and the same principals are excluded from training.
+    Returns (texts, elements, class-index labels, principal ids).
+    """
+    jl = pd.read_json(judge_labelled_path, lines=True)
+    jl = jl[jl["judge_pred"].isin([0, 2, 4])].copy()
+    ids = sorted(jl["PersonId"].astype(str).unique())
+    rng = np.random.default_rng(seed)
+    k = max(1, int(round(len(ids) * fraction)))
+    val_ids = set(rng.permutation(ids)[:k].tolist())
+    v = jl[jl["PersonId"].astype(str).isin(val_ids)]
+    labels = [LABEL_MAP[int(s)] for s in v["judge_pred"]]
+    return v["text"].tolist(), v["element"].tolist(), labels, val_ids
+
+
 def split_by_group(n: int, groups, fraction: float, seed: int = 42):
     """
     Index split into (train_idx, val_idx). With groups, whole groups go to
@@ -91,6 +119,7 @@ def load_condition_data(
     anchor_df: pd.DataFrame | None,
     seed: int = 42,
     judge_labelled_path: str | None = None,
+    exclude_person_ids: set | None = None,
 ) -> tuple[list[str], list[str], list[int]]:
     """
     Assembles training data for one experimental condition.
@@ -119,6 +148,12 @@ def load_condition_data(
          real BIPs with the judge.
     """
     rng = np.random.default_rng(seed)
+
+    # principals whose BIPs form the validation set are kept out of every
+    # condition that trains on real text
+    excluded = {str(p) for p in (exclude_person_ids or [])}
+    if excluded and anchor_df is not None:
+        anchor_df = anchor_df[~anchor_df["PersonId"].astype(str).isin(excluded)]
 
     def _synthetic():
         df = pd.read_json(synthetic_path, lines=True)
@@ -160,6 +195,8 @@ def load_condition_data(
             raise ValueError("judge_real needs judge_labelled_path and synthetic_path")
         jl = pd.read_json(judge_labelled_path, lines=True)
         jl = jl[jl["judge_pred"].isin([0, 2, 4])].copy()
+        if excluded:
+            jl = jl[~jl["PersonId"].astype(str).isin(excluded)]
         jl["judge_pred"] = jl["judge_pred"].astype(int)
         syn = pd.read_json(synthetic_path, lines=True)
         counts = syn.groupby(["element", "target_score"]).size()

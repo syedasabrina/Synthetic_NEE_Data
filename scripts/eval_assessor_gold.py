@@ -25,6 +25,14 @@ Run a trained assessor (GPU):
         --out results/assessor_synthetic_lr1e-4 \
         --compare results/judge_gold_e4b_clean_rows.csv
 
+Score with Gemma answering 0/2/4 from the rubric prompt (GPU). Untuned and
+zero-shot by default; --few_shot_per_cell 1 adds the 21 worked examples;
+--scorer_adapter scores a model fine-tuned by scripts/train_scorer.py:
+    python scripts/eval_assessor_gold.py --generative --label Gemma-ZS \
+        --out results/scorer_Gemma-ZS --compare results/judge_e4b_principal_rows.csv
+    python scripts/eval_assessor_gold.py --generative --scorer_adapter models/Scorer_synthetic \
+        --label Gemma-SFT-Synth --out results/scorer_synthetic --compare results/judge_e4b_principal_rows.csv
+
 Re-report an existing row file with principal-level intervals (CPU):
     python scripts/eval_assessor_gold.py \
         --from_rows results/judge_gold_e4b_clean_rows.csv --label judge_e4b \
@@ -46,6 +54,7 @@ from src.evaluation.gold_metrics import (
 )
 
 HALF_POINTS = (1, 3)
+FAR_LEVEL = {0: 4, 2: 0, 4: 0}   # the level furthest from the truth
 
 
 def heldout_frame(gold: pd.DataFrame) -> pd.DataFrame:
@@ -92,6 +101,28 @@ def predict_assessor(adapter, fallback_base, texts, elements, batch_size, max_le
             probs.extend(torch.softmax(logits, dim=-1).cpu().tolist())
     probs = np.asarray(probs)
     return probs, np.asarray(LEVELS)[probs.argmax(axis=1)]
+
+
+def predict_generative(model_name, adapter, few_shot_per_cell, batch_size, gold):
+    """
+    Gemma answers 0, 2 or 4 from the rubric prompt: untuned (zero-shot), given the
+    21 worked examples (few-shot), or fine-tuned (adapter). Returns answers, None
+    where nothing parseable came back.
+    """
+    from src.rewards.rubric_reward import RubricReward
+
+    few_shot = {}
+    if few_shot_per_cell > 0:
+        # the same one-per-cell examples the data-labelling judge saw, which are
+        # the rows already excluded from the held-out set
+        few_shot = RubricReward.build_few_shot_examples(gold, max_examples=1)
+    judge = RubricReward(
+        model_name=model_name, device="cuda", few_shot_examples=few_shot,
+        batch_size=batch_size, adapter_path=adapter,
+    )
+    preds, raws = judge.predict(gold["Text"].tolist(), gold["Element_numberX"].tolist(),
+                                return_raw=True)
+    return preds, raws
 
 
 def load_rows(path: Path, ours: pd.DataFrame) -> pd.DataFrame:
@@ -183,6 +214,13 @@ def main():
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--adapter", help="trained assessor adapter directory")
     src.add_argument("--from_rows", help="existing row file to re-report (CPU only)")
+    src.add_argument("--generative", action="store_true",
+                     help="score with Gemma answering 0/2/4: untuned, few-shot, or with --scorer_adapter")
+    ap.add_argument("--scorer_adapter", default=None,
+                    help="fine-tuned scorer from scripts/train_scorer.py (with --generative)")
+    ap.add_argument("--scorer_model", default="google/gemma-4-E4B-it")
+    ap.add_argument("--few_shot_per_cell", type=int, default=0, choices=[0, 1],
+                    help="0 = zero-shot (default), 1 = the 21 worked examples")
     ap.add_argument("--label", required=True)
     ap.add_argument("--out", required=True, help="output prefix")
     ap.add_argument("--compare", nargs="*", default=[],
@@ -207,6 +245,19 @@ def main():
         gold["pred"] = pred
         for i, lv in enumerate(LEVELS):
             gold[f"p{lv}"] = probs[:, i]
+    elif args.generative:
+        raw_preds, raws = predict_generative(
+            args.scorer_model, args.scorer_adapter, args.few_shot_per_cell,
+            args.batch_size, gold)
+        # an answer that cannot be parsed counts as a miss, not as a skipped row
+        gold["unparsed"] = [p is None for p in raw_preds]
+        gold["pred"] = [FAR_LEVEL[int(s)] if p is None else p
+                        for p, s in zip(raw_preds, gold["score"])]
+        gold["raw"] = raws
+        if gold["unparsed"].any():
+            print(f"WARNING: {int(gold['unparsed'].sum())} of {len(gold)} answers could not be "
+                  f"parsed; they are counted as wrong. First raw answers: "
+                  f"{[r for r, u in zip(raws, gold['unparsed']) if u][:3]}")
     else:
         prev = load_rows(Path(args.from_rows), gold)
         gold["pred"] = prev["pred"].to_numpy()
@@ -214,7 +265,7 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     cols = ["PersonId", "Element_numberX", "score", "pred", "is_demo", "half_point"]
-    cols += [c for c in ("p0", "p2", "p4") if c in gold]
+    cols += [c for c in ("p0", "p2", "p4", "unparsed") if c in gold]
     gold[cols].to_csv(f"{out}_rows.csv", index=False)
 
     r = report(gold, args.label, [Path(c) for c in args.compare], args.n_boot)

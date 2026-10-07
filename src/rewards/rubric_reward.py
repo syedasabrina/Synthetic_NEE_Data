@@ -83,6 +83,7 @@ class RubricReward:
         batch_size: int = 8,
         max_length: int = 3072,
         chat_template_kwargs: dict | None = None,
+        adapter_path: str | None = None,
     ):
         """
         device: accepts "cuda:2" and similar so the judge can sit on a GPU
@@ -131,6 +132,12 @@ class RubricReward:
             self.model = AutoModelForImageTextToText.from_pretrained(
                 model_name, dtype=torch.bfloat16, device_map=device,
             )
+        if adapter_path:
+            # a LoRA adapter trained with scripts/train_scorer.py: the same model
+            # and the same prompt, fine-tuned to answer 0, 2 or 4
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, adapter_path)
+            print(f"Loaded fine-tuned scorer adapter: {adapter_path}")
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
